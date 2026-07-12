@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Audiobook Visualization Engine</title>
+  <style>
+    body { font: 15px/1.5 system-ui, sans-serif; max-width: 780px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+    h1 { font-size: 1.4rem; }
+    form { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1.5rem; }
+    label { display: block; font-weight: 600; margin: .6rem 0 .2rem; }
+    textarea, input[type=file], input[type=text], select { width: 100%; box-sizing: border-box; }
+    textarea { min-height: 3.5rem; padding: .5rem; }
+    input[type=text], select { padding: .4rem; }
+    .row { display: flex; gap: 1rem; }
+    .row > div { flex: 1; }
+    .check { display: flex; align-items: center; gap: .5rem; font-weight: 400; margin-top: .6rem; }
+    .check input { width: auto; }
+    button { margin-top: .8rem; padding: .5rem 1rem; border: 0; border-radius: 6px;
+             background: #2b6cb0; color: #fff; font-weight: 600; cursor: pointer; }
+    button.secondary { background: #eee; color: #333; padding: .2rem .5rem; font-weight: 400; }
+    h2 { font-size: 1.05rem; margin: 1.2rem 0 .3rem; }
+    .series { color: #555; border-bottom: 2px solid #eee; margin-top: 1rem; }
+    table { width: 100%; border-collapse: collapse; }
+    td { padding: .35rem .5rem; border-bottom: 1px solid #f0f0f0; font-size: .9rem; }
+    .bar { height: 8px; background: #eee; border-radius: 4px; overflow: hidden; }
+    .bar > div { height: 100%; background: #38a169; width: 0; transition: width .3s; }
+    .status-done { color: #2f855a; font-weight: 600; }
+    .status-error { color: #c53030; font-weight: 600; }
+    .muted { color: #777; font-size: .8rem; }
+    .tag { font-size: .7rem; background: #edf2f7; border-radius: 4px; padding: 1px 5px; color: #555; }
+  </style>
+</head>
+<body>
+  <h1>Audiobook Visualization Engine
+    <a href="/logs" target="_blank" style="font-size:.8rem;font-weight:400">logs ↗</a></h1>
+  <p class="muted">Upload EPUB(s). The server segments each book into scenes, generates
+    consistent images, and packages a <code>.bookpack</code> for the Android app. Books
+    in a series share a character/world bible.</p>
+
+  <form id="upload">
+    <label for="epubs">EPUB file(s)</label>
+    <input id="epubs" name="epubs" type="file" accept=".epub" multiple required>
+
+    <div class="row">
+      <div>
+        <label for="series">Series</label>
+        <select id="series"><option value="">➕ New series…</option></select>
+      </div>
+      <div id="newSeriesWrap">
+        <label for="series_name">New series name</label>
+        <input id="series_name" type="text" placeholder="(defaults to first file name)">
+      </div>
+    </div>
+
+    <label for="style">Visual style</label>
+    <select id="style"></select>
+
+    <label for="base_prompt">Extra context (optional)</label>
+    <textarea id="base_prompt"
+      placeholder="e.g. The Expanse TV series look, muted palette, dark tone"></textarea>
+
+    <label class="check"><input id="bible_only" type="checkbox">
+      Bible only — extract characters/descriptions, skip image generation
+      <span class="muted">(use for earlier books to seed the series)</span></label>
+
+    <button type="submit">Process</button>
+  </form>
+
+  <div id="books"></div>
+
+<script>
+async function loadStyles() {
+  const sel = document.getElementById('style');
+  if (sel.options.length) return;  // once
+  const data = await (await fetch('/styles')).json();
+  sel.innerHTML = data.styles.map(s =>
+    `<option value="${s.key}"${s.key === data.default ? ' selected' : ''}>${s.label}</option>`).join('');
+}
+async function loadSeries() {
+  const series = await (await fetch('/series')).json();
+  const sel = document.getElementById('series');
+  const current = sel.value;
+  sel.innerHTML = '<option value="">➕ New series…</option>' +
+    series.map(s => `<option value="${s.id}">${s.name} (${s.book_count})</option>`).join('');
+  sel.value = current;
+  return series;
+}
+document.getElementById('series').addEventListener('change', (e) => {
+  document.getElementById('newSeriesWrap').style.display = e.target.value ? 'none' : 'block';
+});
+
+function statusCell(job) {
+  if (job.status === 'done') return '<span class="status-done">done</span>';
+  if (job.status === 'error') return `<span class="status-error" title="${(job.error||'').replace(/"/g,"'")}">error</span>`;
+  const label = job.status === 'paused' ? `⏸ ${job.message}` : `${job.stage} · ${job.message}`;
+  return `<div class="bar"><div style="width:${Math.round(job.progress*100)}%"></div></div>` +
+         `<span class="muted">${label}</span>`;
+}
+
+const ACTIVE = new Set(['running', 'queued', 'paused']);
+let pollTimer = null;
+
+async function refresh() {
+  const series = await loadSeries();
+  const seriesName = Object.fromEntries(series.map(s => [s.id, s.name]));
+  const books = await (await fetch('/books')).json();
+  // group by series_id
+  const groups = {};
+  for (const b of books) (groups[b.series_id] ||= []).push(b);
+
+  const container = document.getElementById('books');
+  container.innerHTML = '';
+  for (const [sid, list] of Object.entries(groups)) {
+    list.sort((a,b) => a.series_seq - b.series_seq);
+    const h = document.createElement('h2');
+    h.className = 'series';
+    h.textContent = seriesName[sid] || 'Ungrouped';
+    container.appendChild(h);
+    const table = document.createElement('table');
+    for (const b of list) {
+      // Only fetch job detail (progress/error) for active or errored books;
+      // terminal books render straight from the /books summary — no extra call.
+      const job = (ACTIVE.has(b.status) || b.status === 'error')
+        ? await (await fetch('/jobs/' + b.id)).json()
+        : { status: b.status, progress: 1, stage: '', message: '' };
+      let actions = '';
+      if (job.status === 'done' && b.has_pack)
+        actions = `<a href="/books/${b.id}/pack"><button class="secondary">download</button></a> `;
+      else if (job.status === 'running' || job.status === 'queued')
+        actions = `<button class="secondary" onclick="pause('${b.id}')">pause</button> `;
+      else if (job.status === 'paused')
+        actions = `<button class="secondary" onclick="resume('${b.id}')">resume</button> `;
+      if (job.status === 'done' || job.status === 'error' || job.status === 'paused')
+        actions += `<button class="secondary" onclick="reprocess('${b.id}')">reprocess</button> `;
+      const bibleTag = (job.status === 'done' && !b.has_pack) ? '<span class="tag">bible</span> ' : '';
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        `<td>${bibleTag}${b.title || 'Untitled'}<div class="muted">${b.author} · ${b.num_scenes} scenes</div></td>` +
+        `<td>${statusCell(job)}</td>` +
+        `<td style="text-align:right">${actions}<button class="secondary" onclick="del('${b.id}')">delete</button></td>`;
+      table.appendChild(tr);
+    }
+    container.appendChild(table);
+  }
+
+  // Poll fast only while something is processing; otherwise idle slowly.
+  const active = books.some(b => ACTIVE.has(b.status));
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(refresh, active ? 2000 : 15000);
+}
+async function del(id) {
+  if (!confirm('Delete this book?')) return;
+  await fetch('/books/' + id, { method: 'DELETE' });
+  refresh();
+}
+async function pause(id) { await fetch('/books/' + id + '/pause', { method: 'POST' }); refresh(); }
+async function resume(id) { await fetch('/books/' + id + '/resume', { method: 'POST' }); refresh(); }
+async function reprocess(id) {
+  if (!confirm('Reprocess from scratch? Existing images for this book are discarded.')) return;
+  await fetch('/books/' + id + '/reprocess', { method: 'POST' }); refresh();
+}
+document.getElementById('upload').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData();
+  for (const f of document.getElementById('epubs').files) fd.append('epubs', f);
+  fd.append('base_prompt', document.getElementById('base_prompt').value);
+  fd.append('style', document.getElementById('style').value);
+  fd.append('series_id', document.getElementById('series').value);
+  fd.append('series_name', document.getElementById('series_name').value);
+  fd.append('bible_only', document.getElementById('bible_only').checked);
+  const btn = e.target.querySelector('button');
+  btn.disabled = true; btn.textContent = 'Uploading…';
+  await fetch('/books', { method: 'POST', body: fd });
+  btn.disabled = false; btn.textContent = 'Process';
+  e.target.reset();
+  document.getElementById('newSeriesWrap').style.display = 'block';
+  refresh();
+});
+loadStyles();
+refresh();  // self-schedules: 2s while active, 15s when idle
+</script>
+</body>
+</html>

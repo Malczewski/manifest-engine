@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Server runtime data (generated books, packs, db)
+server/data/
+
+# OS
+.DS_Store

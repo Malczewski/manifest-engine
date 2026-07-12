@@ -1,0 +1,13 @@
+# Audiobook Visualization Engine — pre-processing server
+# Install from the regular PyPI registry:  pip install -r requirements.txt
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+jinja2==3.1.5
+python-multipart==0.0.20
+ebooklib==0.18
+beautifulsoup4==4.12.3
+lxml==5.3.0
+pillow==11.1.0
+httpx==0.28.1
+aiofiles==24.1.0
+pydantic==2.10.5

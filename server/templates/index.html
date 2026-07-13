@@ -129,7 +129,7 @@ async function refresh() {
         actions = `<a href="/books/${b.id}/pack"><button class="secondary">download</button></a> `;
       else if (job.status === 'running' || job.status === 'queued')
         actions = `<button class="secondary" onclick="pause('${b.id}')">pause</button> `;
-      else if (job.status === 'paused')
+      else if (job.status === 'paused' || job.status === 'error')
         actions = `<button class="secondary" onclick="resume('${b.id}')">resume</button> `;
       if (job.status === 'done' || job.status === 'error' || job.status === 'paused')
         actions += `<button class="secondary" onclick="reprocess('${b.id}')">reprocess</button> `;

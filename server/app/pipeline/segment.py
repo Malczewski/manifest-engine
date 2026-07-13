@@ -12,11 +12,9 @@ stays exactly aligned to the whole-book coordinate system from epub_parse.
 
 from __future__ import annotations
 
-import json
 import re
 
-import httpx
-
+from . import llm
 from ..config import settings
 from ..models import Chapter, Scene
 
@@ -111,6 +109,32 @@ characters. Paragraphs:
 # sent to the LLM, so a huge single-document chapter never overflows the prompt.
 _WINDOW_CHARS = 8000
 
+# JSON schema handed to Ollama so the model is CONSTRAINED to valid JSON of this
+# shape — some models (e.g. gemma3) otherwise emit malformed JSON with format=json.
+_SCENES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scenes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "start_para": {"type": "integer"},
+                    "end_para": {"type": "integer"},
+                    "summary": {"type": "string"},
+                    "location": {"type": "string"},
+                    "characters": {"type": "array", "items": {"type": "string"}},
+                    "mood": {"type": "string"},
+                    "time_of_day": {"type": "string"},
+                    "key_action": {"type": "string"},
+                },
+                "required": ["start_para", "end_para", "characters"],
+            },
+        }
+    },
+    "required": ["scenes"],
+}
+
 
 def _windows(paras: list[tuple[int, int, str]], max_chars: int):
     """Yield contiguous sublists of paragraphs, each up to ~max_chars."""
@@ -131,23 +155,7 @@ def _segment_window(
 ) -> list[Scene]:
     numbered = "\n".join(f"[{i}] {p[2][:500]}" for i, p in enumerate(paras))
     prompt = _LLM_PROMPT.format(target=settings.target_scene_chars, paras=numbered)
-    resp = httpx.post(
-        f"{settings.ollama_url}/api/generate",
-        trust_env=False,  # never proxy localhost
-        json={
-            "model": settings.ollama_model,
-            "prompt": prompt,
-            "stream": False,
-            "format": "json",
-            # qwen3 and other reasoning models: skip the <think> pass so we get
-            # clean JSON straight away (ignored by non-thinking models).
-            "think": False,
-            "options": {"temperature": 0.2},
-        },
-        timeout=300,
-    )
-    resp.raise_for_status()
-    data = json.loads(resp.json()["response"])
+    data = llm.call_json(prompt, schema=_SCENES_SCHEMA, temperature=0.2)
     scenes: list[Scene] = []
     for s in data.get("scenes", []):
         a = max(0, int(s["start_para"]))
@@ -168,8 +176,8 @@ def _segment_window(
     return scenes
 
 
-def _ollama(chapter: Chapter, next_id: int, on_window=None) -> list[Scene]:
-    """Segment a chapter, windowing large text so LLM prompts stay bounded."""
+def _llm(chapter: Chapter, next_id: int, on_window=None) -> list[Scene]:
+    """Segment a chapter via LLM, windowing large text so prompts stay bounded."""
     paras = _paragraphs(chapter.text)
     if not paras:
         return []
@@ -189,17 +197,17 @@ def _slug(text: str) -> str:
 
 
 def segment_chapter(chapter: Chapter, next_id: int, on_window=None) -> list[Scene]:
-    if settings.segmenter == "ollama":
+    if settings.use_llm:
         try:
-            return _ollama(chapter, next_id, on_window=on_window)
+            return _llm(chapter, next_id, on_window=on_window)
         except Exception as exc:  # noqa: BLE001
-            # Flaky model / not running -> don't block, but make it visible so a
-            # silent drop to heuristic segmentation isn't mistaken for success.
+            # Flaky model / quota / not running -> don't block, but make it
+            # visible so a silent drop to heuristic isn't mistaken for success.
             from ..log import get_logger
 
             get_logger("segment").warning(
-                "Ollama segmentation failed (%s); using heuristic for chapter %d",
-                exc, chapter.idx,
+                "%s segmentation failed (%s); using heuristic for chapter %d",
+                settings.segmenter, exc, chapter.idx,
             )
             return _heuristic(chapter, next_id)
     return _heuristic(chapter, next_id)
@@ -212,7 +220,7 @@ def _window_count(chapter: Chapter) -> int:
 def segment_book(chapters: list[Chapter], progress=None) -> list[Scene]:
     """Segment all chapters. `progress(frac)` (0..1) is called as LLM windows
     complete so a long segmentation pass shows movement, not a frozen bar."""
-    use_llm = settings.segmenter == "ollama"
+    use_llm = settings.use_llm
     total = (
         sum(_window_count(c) for c in chapters) if use_llm else max(1, len(chapters))
     )

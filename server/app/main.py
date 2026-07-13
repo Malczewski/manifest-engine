@@ -32,10 +32,16 @@ def _log_backends() -> None:
     config (e.g. falling back to stub/heuristic) is obvious at startup."""
     import httpx
 
+    llm_info = settings.gemini_model if settings.segmenter == "gemini" else settings.ollama_model
     log.info("segmenter=%s (%s) | image=%s (%s) | compose_prompts=%s",
-             settings.segmenter, settings.ollama_model, settings.image_backend,
+             settings.segmenter, llm_info, settings.image_backend,
              settings.image_model, settings.compose_prompts)
-    if settings.segmenter == "ollama":
+    if settings.segmenter == "gemini":
+        if settings.gemini_api_key:
+            log.info("Gemini: model=%s, API key configured", settings.gemini_model)
+        else:
+            log.warning("Gemini: GEMINI_API_KEY is not set; all LLM calls will fail")
+    elif settings.segmenter == "ollama":
         try:
             httpx.get(f"{settings.ollama_url}/api/tags", trust_env=False, timeout=3).raise_for_status()
             log.info("Ollama: reachable at %s", settings.ollama_url)

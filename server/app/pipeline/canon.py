@@ -11,11 +11,11 @@ and cross-book/scene consistency. No-ops if the LLM is unavailable.
 
 from __future__ import annotations
 
-import json
 import re
 
 import httpx
 
+from . import jsonutil
 from ..config import settings
 from ..models import Scene
 
@@ -64,7 +64,7 @@ def _ollama_json(prompt: str) -> dict:
         timeout=180,
     )
     resp.raise_for_status()
-    return json.loads(resp.json()["response"])
+    return jsonutil.loads(resp.json()["response"])
 
 
 def canonicalize_scenes(scenes: list[Scene]) -> None:

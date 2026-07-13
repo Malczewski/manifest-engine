@@ -121,14 +121,14 @@ def run_pipeline(
                 "title": title, "author": author, "num_scenes": n,
                 "world": world, "entities": entities, "paused": True,
             }
-        prompt = prompts.build_scene_prompt(scene, base_prompt, bible_map, world)
+        prompt = prompts.build_scene_prompt(scene, base_prompt, bible_map, world, chapters=chapters)
         seed = _scene_seed(scene)
         log.info("Scene %d/%d ch%d cast=%s seed=%d\n  prompt: %s",
                  i + 1, n, scene.chapter_idx, scene.characters, seed, prompt)
         init = last_by_loc.get(scene.location_id) if (
             settings.continuity_img2img and scene.location_id) else None
         t0 = time.time()
-        png = generator.generate(prompt, seed, init)
+        png = _generate_with_retry(generator, prompt, seed, init, i + 1, n)
         fp.write_bytes(png)
         log.info("Scene %d/%d done in %.1fs (%d KB)", i + 1, n, time.time() - t0, len(png) // 1024)
         if settings.continuity_img2img and scene.location_id:
@@ -174,23 +174,36 @@ def _prepare(epub_path, base_prompt, prior_world, prior_bible, progress, on_pars
 
     progress("bible", 0.22, "Building story bible")
     entities = bible.build_bible(scenes, settings.bible_min_scenes)
+    # Carry over reference-image paths from a prior book in the series (idempotent
+    # across books; the image files are already in the series work dir). Descriptors
+    # are NOT carried over here — enrich() will re-derive them from this book's text
+    # using the prior descriptor as seed context (see prior_descs below).
     for e in entities:
         prior = prior_bible.get(normalize_name(e.name))
-        if prior:
-            e.descriptor = prior.get("descriptor") or e.descriptor
-            e.image_path = prior.get("image_path") or e.image_path
+        if prior and prior.get("image_path"):
+            e.image_path = prior["image_path"]
     log.info("Bible: %d entities (%s)", len(entities),
              ", ".join(e.name for e in entities if e.kind == "character")[:200])
 
     progress("enrich", 0.25, "Describing world and characters")
-    to_describe = [e for e in entities if normalize_name(e.name) not in prior_bible]
+    # Collect existing stable-fact descriptors from the series so the LLM can
+    # extend rather than reinvent — cross-book continuity without freezing the
+    # description to the first book's text.
+    prior_descs: dict[str, str] = {
+        k: v["descriptor"]
+        for k, v in prior_bible.items()
+        if v.get("descriptor")
+    }
     world = prior_world
-    if to_describe or not world:
-        targets = to_describe or entities
-        log.info("Enriching %d entities…", len(targets))
+    if entities or not world:
+        n_prior = sum(1 for e in entities if normalize_name(e.name) in prior_bible)
+        log.info("Enriching %d entities (%d with prior context)…", len(entities), n_prior)
         described = enrich.enrich(
-            targets, _sample_excerpt(text),
+            entities,
             progress=lambda f: progress("enrich", 0.25, f"Describing entities {int(f * 100)}%"),
+            scenes=scenes,
+            chapters=chapters,
+            prior_descs=prior_descs or None,
         )
         world = world or described
     log.info("World: %s", world)
@@ -254,14 +267,25 @@ def _load_checkpoint(path: Path):
     return d["title"], d["author"], d["world"], chapters, scenes, entities
 
 
-def _sample_excerpt(text: str, total: int = 12000, parts: int = 3) -> str:
-    """A representative sample of the book (start/middle/end) for enrichment, so
-    entity descriptions cover characters throughout, not only the opening."""
-    if len(text) <= total:
-        return text
-    chunk = total // parts
-    starts = [0, (len(text) - chunk) // 2, len(text) - chunk]
-    return "\n[...]\n".join(text[s : s + chunk] for s in starts)
+
+def _generate_with_retry(generator, prompt, seed, init, idx, total, attempts=3):
+    """Retry transient image-backend failures with backoff. If it still fails, the
+    job errors out — but already-generated images are on disk, so Resume continues
+    from here once the backend is back."""
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return generator.generate(prompt, seed, init)
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            log.warning("Scene %d/%d image failed (attempt %d/%d): %s",
+                        idx, total, attempt, attempts, exc)
+            if attempt < attempts:
+                time.sleep(3 * attempt)
+    raise RuntimeError(
+        f"Image generation failed at scene {idx}/{total} after {attempts} attempts "
+        f"(is the image backend running?): {last}"
+    )
 
 
 def _seed(key: str) -> int:

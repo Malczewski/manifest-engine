@@ -97,10 +97,11 @@ def _run(
         )
     except Exception as exc:  # noqa: BLE001 - report any failure to the client
         log.exception("Book %s: failed", book_id)
+        resumable = (book_dir / "checkpoint.json").exists()
         _update(
             book_id,
             status=JobStatus.error.value,
-            message="Failed",
+            message="Failed — Resume to retry from checkpoint" if resumable else "Failed",
             error=f"{exc}\n{traceback.format_exc()}",
         )
 

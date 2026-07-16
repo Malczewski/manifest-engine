@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS series_entities (
     kind       TEXT NOT NULL,
     name       TEXT NOT NULL,
     descriptor TEXT NOT NULL DEFAULT '',
+    facts      TEXT NOT NULL DEFAULT '[]',  -- JSON list of accumulated stable facts
     image_path TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (series_id, norm)
 );
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS series_entities (
 _MIGRATIONS = [
     ("books", "series_id", "TEXT NOT NULL DEFAULT ''"),
     ("books", "series_seq", "INTEGER NOT NULL DEFAULT 0"),
+    ("series_entities", "facts", "TEXT NOT NULL DEFAULT '[]'"),
 ]
 
 

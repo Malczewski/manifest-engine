@@ -42,12 +42,21 @@ class Chapter:
 
 @dataclass
 class Entity:
-    """A character or location in the story bible."""
+    """A character or location in the story bible.
+
+    `descriptor` is the STABLE identity anchor (synthesized from `facts`); it drives
+    the per-cast seed and the base look, so it stays constant across the whole book.
+    `facts` are the raw accumulated stable observations (hair, species, marks) that
+    the forward state pass gathers scene by scene and that seed later books in a
+    series. Scene-specific state (current outfit, injury) is NOT here — it lives per
+    scene in Scene.overlays.
+    """
 
     id: str
     kind: str  # "character" | "location"
     name: str
     descriptor: str = ""
+    facts: list[str] = field(default_factory=list)
     image_path: str = ""  # relative path inside the pack, e.g. images/char_x.png
 
 
@@ -65,6 +74,12 @@ class Scene:
     time_of_day: str = ""
     key_action: str = ""
     image_path: str = ""  # relative path inside the pack, e.g. images/scene_0001.png
+    # Final composed image prompt for this scene (built by the forward state pass:
+    # base style + scene line + per-entity identity + per-entity temporal overlay).
+    prompt: str = ""
+    # Per-entity scene-specific visible state in effect at this scene (name ->
+    # "wearing a blue cloak" / "left arm in a sling"). Carried forward until changed.
+    overlays: dict[str, str] = field(default_factory=dict)
     # token positions, filled during indexing
     start_token: int = 0
     end_token: int = 0

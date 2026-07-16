@@ -69,7 +69,7 @@ fun LibraryScreen(
             LazyColumn(Modifier.fillMaxSize()) {
                 if (ui.local.isNotEmpty()) {
                     item { SectionHeader("On this device") }
-                    items(ui.local, key = { it.bookId }) { book ->
+                    items(ui.local, key = { "local_${it.bookId}" }) { book ->
                         ListItem(
                             headlineContent = { Text(book.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                             supportingContent = { Text("${book.author} · ${book.numScenes} scenes") },
@@ -84,7 +84,7 @@ fun LibraryScreen(
                 }
 
                 item { SectionHeader("On the server") }
-                items(ui.remote, key = { it.id }) { book ->
+                items(ui.remote, key = { "remote_${it.id}" }) { book ->
                     val progress = ui.downloading[book.id]
                     ListItem(
                         headlineContent = { Text(book.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },

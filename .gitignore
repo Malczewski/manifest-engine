@@ -7,5 +7,13 @@ venv/
 # Server runtime data (generated books, packs, db)
 server/data/
 
+build/
+.gradle/
+android/gradle/wrapper/gradle-wrapper.jar
+gradlew.bat
+.idea
+
 # OS
 .DS_Store
+
+android/local.properties

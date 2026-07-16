@@ -8,6 +8,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import java.util.UUID
 
@@ -34,7 +35,7 @@ class ServerStore(private val context: Context) {
             val current = prefs[serversKey]
                 ?.let { runCatching { Json.decodeFromString<List<Server>>(it) }.getOrNull() }
                 ?: emptyList()
-            prefs[serversKey] = Json.encodeToString(current + server)
+            prefs[serversKey] = Json.encodeToString(ListSerializer(Server.serializer()), current + server)
             if (prefs[activeKey] == null) prefs[activeKey] = server.id
         }
         return server
@@ -46,7 +47,7 @@ class ServerStore(private val context: Context) {
                 ?.let { runCatching { Json.decodeFromString<List<Server>>(it) }.getOrNull() }
                 ?: emptyList()
             val next = current.filterNot { it.id == id }
-            prefs[serversKey] = Json.encodeToString(next)
+            prefs[serversKey] = Json.encodeToString(ListSerializer(Server.serializer()), next)
             if (prefs[activeKey] == id) prefs[activeKey] = next.firstOrNull()?.id ?: ""
         }
     }

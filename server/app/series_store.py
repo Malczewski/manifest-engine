@@ -8,6 +8,7 @@ inherit them.
 
 from __future__ import annotations
 
+import json
 import uuid
 
 from .db import connect
@@ -43,21 +44,36 @@ def next_seq(series_id: str) -> int:
 
 
 def load_bible(series_id: str) -> tuple[str, dict[str, dict]]:
-    """Return (world, {norm: {kind, name, descriptor, image_path}})."""
+    """Return (world, {norm: {kind, name, descriptor, facts, image_path}})."""
     if not series_id:
         return "", {}
     with connect() as conn:
         srow = conn.execute("SELECT world FROM series WHERE id = ?", (series_id,)).fetchone()
         world = srow["world"] if srow else ""
         rows = conn.execute(
-            "SELECT norm, kind, name, descriptor, image_path FROM series_entities WHERE series_id = ?",
+            "SELECT norm, kind, name, descriptor, facts, image_path "
+            "FROM series_entities WHERE series_id = ?",
             (series_id,),
         ).fetchall()
-    return world, {r["norm"]: dict(r) for r in rows}
+    out: dict[str, dict] = {}
+    for r in rows:
+        d = dict(r)
+        try:
+            d["facts"] = json.loads(d.get("facts") or "[]")
+        except (TypeError, ValueError):
+            d["facts"] = []
+        out[r["norm"]] = d
+    return world, out
 
 
 def save_bible(series_id: str, world: str, entities: list[Entity]) -> None:
-    """Upsert the series world + entities after a book is processed."""
+    """Upsert the series world + entities after a book is processed.
+
+    The forward state pass seeds each book with the prior facts/description, so an
+    entity's post-book state already INCLUDES everything earlier books contributed
+    (extended/refined). We therefore write it forward as the new series state —
+    later books override earlier ones where their own text disagrees. Reference
+    image paths are kept first (we don't regenerate a character's reference)."""
     if not series_id:
         return
     from .pipeline.bible import normalize_name
@@ -70,17 +86,19 @@ def save_bible(series_id: str, world: str, entities: list[Entity]) -> None:
             )
         for e in entities:
             norm = normalize_name(e.name)
-            # Keep the first non-empty descriptor/image we learn for an entity so
-            # later books stay consistent with earlier ones.
+            facts_json = json.dumps(e.facts or [])
             conn.execute(
                 """
-                INSERT INTO series_entities(series_id, norm, kind, name, descriptor, image_path)
-                VALUES (?,?,?,?,?,?)
+                INSERT INTO series_entities(series_id, norm, kind, name, descriptor, facts, image_path)
+                VALUES (?,?,?,?,?,?,?)
                 ON CONFLICT(series_id, norm) DO UPDATE SET
-                    descriptor = CASE WHEN series_entities.descriptor = '' THEN excluded.descriptor
+                    name       = excluded.name,
+                    descriptor = CASE WHEN excluded.descriptor <> '' THEN excluded.descriptor
                                       ELSE series_entities.descriptor END,
+                    facts      = CASE WHEN excluded.facts <> '[]' THEN excluded.facts
+                                      ELSE series_entities.facts END,
                     image_path = CASE WHEN series_entities.image_path = '' THEN excluded.image_path
                                       ELSE series_entities.image_path END
                 """,
-                (series_id, norm, e.kind, e.name, e.descriptor, e.image_path),
+                (series_id, norm, e.kind, e.name, e.descriptor, facts_json, e.image_path),
             )

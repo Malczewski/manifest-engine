@@ -1,5 +1,9 @@
 package com.manifestengine.viz.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -47,7 +51,14 @@ import java.io.File
 fun ReaderScreen(bookId: String, onBack: () -> Unit, vm: ReaderViewModel = viewModel()) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     LaunchedEffect(bookId) { vm.load(bookId) }
+    val context = LocalContext.current
     var menuOpen by remember { mutableStateOf(false) }
+
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) vm.setListening(true)
+    }
 
     Scaffold(
         topBar = {
@@ -76,20 +87,35 @@ fun ReaderScreen(bookId: String, onBack: () -> Unit, vm: ReaderViewModel = viewM
         },
     ) { pad ->
         Column(Modifier.padding(pad).fillMaxSize()) {
-            // --- listening toggle (auto vs manual) ---
+            // Listening toggle
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(if (ui.listening) "Listening (auto)" else "Manual")
-                Switch(checked = ui.listening, onCheckedChange = { vm.setListening(it) })
+                Switch(
+                    checked = ui.listening,
+                    onCheckedChange = { enabled ->
+                        if (enabled) {
+                            if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                                == PackageManager.PERMISSION_GRANTED
+                            ) {
+                                vm.setListening(true)
+                            } else {
+                                micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                            }
+                        } else {
+                            vm.setListening(false)
+                        }
+                    },
+                )
             }
 
+            // Scene image
             Box(Modifier.weight(1f).fillMaxWidth().background(Color.Black), Alignment.Center) {
                 val scene = ui.currentScene
                 if (scene != null) {
-                    val context = LocalContext.current
                     AsyncImage(
                         model = ImageRequest.Builder(context)
                             .data(File(scene.imagePath))
@@ -99,7 +125,6 @@ fun ReaderScreen(bookId: String, onBack: () -> Unit, vm: ReaderViewModel = viewM
                         contentScale = ContentScale.Fit,
                         modifier = Modifier.fillMaxSize(),
                     )
-                    // Caption overlay.
                     Text(
                         scene.summary,
                         color = Color.White,
@@ -116,14 +141,9 @@ fun ReaderScreen(bookId: String, onBack: () -> Unit, vm: ReaderViewModel = viewM
                 }
             }
 
+            // Controls
             if (ui.listening) {
-                // Phase 3: mic + Whisper + matcher drive the scene automatically.
-                Text(
-                    "Auto mode: microphone + on-device ASR will drive scenes (coming in Phase 3). " +
-                        "Toggle off to navigate manually.",
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(16.dp),
-                )
+                ListeningPanel(lastTranscript = ui.lastTranscript)
             } else {
                 ManualControls(
                     position = ui.sceneIdx + 1,
@@ -132,6 +152,41 @@ fun ReaderScreen(bookId: String, onBack: () -> Unit, vm: ReaderViewModel = viewM
                     onNext = { vm.next() },
                 )
             }
+
+            // Error banner (e.g. ASR unavailable) shown below controls when a scene is visible
+            ui.error?.takeIf { ui.currentScene != null }?.let {
+                Text(
+                    it,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ListeningPanel(lastTranscript: String) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+    ) {
+        Text(
+            "Listening…",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.primary,
+        )
+        if (lastTranscript.isNotBlank()) {
+            Text(
+                "“$lastTranscript”",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 4.dp),
+            )
         }
     }
 }

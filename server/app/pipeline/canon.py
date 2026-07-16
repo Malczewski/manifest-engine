@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import re
 
-import httpx
-
-from . import jsonutil
+from . import llm
 from ..config import settings
+from ..log import get_logger
 from ..models import Scene
+
+log = get_logger("canon")
 
 _PROMPT = """Consolidate these entity names from ONE book. Merge two names ONLY when
 you are CONFIDENT they denote the SAME individual. Be conservative — when in doubt,
@@ -49,35 +50,19 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")[:48]
 
 
-def _ollama_json(prompt: str) -> dict:
-    resp = httpx.post(
-        f"{settings.ollama_url}/api/generate",
-        trust_env=False,
-        json={
-            "model": settings.ollama_model,
-            "prompt": prompt,
-            "stream": False,
-            "format": "json",
-            "think": False,
-            "options": {"temperature": 0.1},
-        },
-        timeout=180,
-    )
-    resp.raise_for_status()
-    return jsonutil.loads(resp.json()["response"])
-
-
 def canonicalize_scenes(scenes: list[Scene]) -> None:
     """Rewrite scene.characters and scene.location_id to canonical names."""
-    if settings.segmenter != "ollama":
+    if not settings.use_llm:
         return
     chars = sorted({c for s in scenes for c in s.characters if c.strip()})
     locs = sorted({s.location_id.replace("_", " ") for s in scenes if s.location_id})
     if not chars and not locs:
         return
+    log.info("canon: %d chars, %d locs", len(chars), len(locs))
     try:
-        data = _ollama_json(_PROMPT.format(chars=chars, locs=locs))
-    except Exception:
+        data = llm.call_json(_PROMPT.format(chars=chars, locs=locs), temperature=0.1)
+    except Exception as exc:
+        log.warning("canon LLM call failed: %s", exc)
         return  # LLM unavailable -> leave names as-is (string dedup still applies)
 
     cmap = {str(k): str(v) for k, v in data.get("characters", {}).items()}

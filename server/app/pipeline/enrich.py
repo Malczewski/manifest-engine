@@ -34,10 +34,15 @@ from __future__ import annotations
 import difflib
 import re
 
+import time
+
 from . import llm
 from .bible import normalize_name
 from ..config import settings
+from ..log import get_logger
 from ..models import Chapter, Entity, Scene
+
+log = get_logger("enrich")
 
 # ---------------------------------------------------------------------------
 # Prompts
@@ -102,15 +107,19 @@ WORLD: 1-2 sentences of ART DIRECTION only (medium, palette, mood, kind of setti
 synthesised from the world hints below. Do NOT list specific creatures/landmarks; if
 you must name a distinctive thing, say what it ACTUALLY is (e.g. "dogs" = alien beasts).
 
-For each entity, write description = ONE concrete sentence (15-30 words) of STABLE
-PHYSICAL ATTRIBUTES ONLY (species, age, build, hair, eyes, skin, permanent marks):
+For each entity, write description = ONE concrete sentence (15-30 words) of INHERENT,
+TIMELESS physical attributes ONLY (species, age, build, hair, eyes, skin, freckles,
+birthmarks) — traits that are true in EVERY scene of the book:
 - Merge ALL the observed facts into one coherent look. If facts conflict, prefer the
   more specific / more frequently attested one.
 - If a prior-book description is given, EXTEND/REFINE it with the new facts; only
   override it where the new facts clearly contradict it. Do not reinvent it.
 - Where facts are thin, choose plausible concrete details that fit and state them
   definitely — never vague filler ("practical clothing", "standard build").
-- NEVER include clothing, emotional state, personality, role, or plot.
+- NEVER include clothing, emotional state, personality, role, plot, OR anything
+  ACQUIRED during the story (wounds, a scar from a fight, blood, ageing, a haircut).
+  If such an item appears in the observed facts, IGNORE it — those are rendered per
+  scene, and folding them here would wrongly back-date them to earlier scenes.
 - Keep entities distinct; a human is fully human unless stated otherwise.
 - No "same as"/"like X".
 
@@ -320,7 +329,7 @@ def _extract_facts(chunk_text: str, present_names: list[str]) -> tuple[dict[str,
 # Reduce phase
 # ---------------------------------------------------------------------------
 
-def _consolidate(
+def consolidate(
     entities: list[Entity],
     facts_by_norm: dict[str, list[str]],
     world_hints: list[str],
@@ -328,24 +337,31 @@ def _consolidate(
 ) -> str:
     """Reduce accumulated facts (+ prior descriptions) into final descriptors.
 
-    Fills entity.descriptor in place and returns the synthesised world string.
+    Fills entity.descriptor AND entity.facts in place and returns the synthesised
+    world string. Shared by the bible-only chunk harvest (this module) and the
+    full forward state pass (statepass.py).
     """
     blocks: list[str] = []
     for ent in entities:
         norm = normalize_name(ent.name)
         facts = facts_by_norm.get(norm, [])
+        ent.facts = list(facts)  # persist the raw accumulated facts on the entity
         prior = prior_descs.get(norm, "")
         fact_str = "; ".join(facts) if facts else "(none observed)"
         blocks.append(f"- {ent.name} — prior: {prior or '(none)'} — facts: {fact_str}")
 
     hint_str = "; ".join(h for h in world_hints if h)[:600] or "(none)"
+    log.info("enrich reduce: consolidating %d entities", len(entities))
+    t0 = time.monotonic()
     try:
         data = llm.call_json(
             _CONSOLIDATE_PROMPT.format(world_hints=hint_str, entity_blocks="\n".join(blocks)),
             schema=_ENRICH_SCHEMA,
             temperature=0.3,
         )
-    except Exception:
+        log.info("enrich reduce done %.1fs", time.monotonic() - t0)
+    except Exception as exc:
+        log.warning("enrich reduce LLM call failed: %s", exc)
         return ""
 
     world = _trim(str(data.get("world", "")), 320)
@@ -368,7 +384,58 @@ def _consolidate(
 # Entry point
 # ---------------------------------------------------------------------------
 
-def enrich(
+def dedupe_facts(facts_by_norm: dict[str, list[str]]) -> None:
+    """De-dupe each entity's facts in place, preserving order (case-insensitive)."""
+    for norm, facts in facts_by_norm.items():
+        seen: set[str] = set()
+        deduped = []
+        for f in facts:
+            key = f.lower()
+            if key not in seen:
+                seen.add(key)
+                deduped.append(f)
+        facts_by_norm[norm] = deduped
+
+
+# Words that mark a fact as ACQUIRED/transient (an event, not an inherent trait).
+# Such items must not enter the timeless identity descriptor, or they leak backward
+# into earlier scenes. "scar" is intentionally excluded (often inherent); the
+# extraction prompt routes event-scars to the per-scene overlay instead.
+_TRANSIENT_FACT = re.compile(
+    r"\b(wound(?:ed|s)?|bleed\w*|bled|blood\w*|bruis\w*|gash\w*|scab\w*|scratch\w*|"
+    r"dirt|dirty|mud|muddy|soaked|soaking|drenched|sweat\w*|limp(?:ing|ed)?|"
+    r"exhaust\w*|dying|dead|corpse|tearful|crying|weeping|ageing|aging|"
+    r"older now|grey with age|wrinkl\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def strip_transient_facts(facts_by_norm: dict[str, list[str]]) -> None:
+    """Drop clearly acquired/transient facts in place — a deterministic backstop
+    for when the model misclassifies an event as an inherent fact."""
+    for norm, facts in facts_by_norm.items():
+        facts_by_norm[norm] = [f for f in facts if not _TRANSIENT_FACT.search(f)]
+
+
+def fill_blank_descriptors(
+    entities: list[Entity],
+    scenes: list[Scene],
+    chapters: list[Chapter],
+    prior_descs: dict[str, str],
+    progress=None,
+) -> None:
+    """Re-describe the few entities that came back blank or cross-referenced,
+    from their own scenes; fall back to the prior-book description if any."""
+    bad = [e for e in entities if not e.descriptor or _CROSSREF.search(e.descriptor)]
+    for i, ent in enumerate(bad):
+        if progress:
+            progress(0.9 + 0.1 * (i / max(1, len(bad))))
+        prior = prior_descs.get(normalize_name(ent.name), "")
+        desc = _describe_one(ent.name, ent, scenes, chapters) or prior
+        ent.descriptor = desc if desc and not _CROSSREF.search(desc) else ""
+
+
+def harvest(
     entities: list[Entity],
     progress=None,
     *,
@@ -376,15 +443,12 @@ def enrich(
     chapters: list[Chapter],
     prior_descs: dict[str, str] | None = None,
 ) -> str:
-    """Whole-book map-reduce enrichment. Fills entity.descriptor in place and
-    returns a short world string.
+    """Bible-only whole-book map-reduce: cheap fact extraction over CHUNKS (not
+    per scene), then consolidation. Used when we only need the accumulated bible
+    (facts + descriptors), not per-scene overlays — e.g. bible_only harvesting
+    from earlier books. Full runs use the forward state pass (statepass.py).
 
-    Args:
-        entities:    bible entities to describe
-        scenes:      all book scenes (chunk boundaries + entity presence)
-        chapters:    all book chapters (source of scene text)
-        prior_descs: normalized-name -> descriptor from an earlier book, used as
-                     seed context in the reduce step for cross-book continuity
+    Fills entity.descriptor + entity.facts in place; returns a world string.
     """
     if not entities or not settings.use_llm:
         return ""
@@ -398,44 +462,35 @@ def enrich(
     facts_by_norm: dict[str, list[str]] = {}
     world_hints: list[str] = []
     name_to_norm = {e.name.lower(): normalize_name(e.name) for e in entities}
+    log.info("enrich map: %d chunks, %d entities", len(chunks), len(entities))
     for i, (chunk_text, present) in enumerate(chunks):
         if progress:
             progress(0.05 + 0.75 * (i / len(chunks)))
+        log.info(
+            "enrich chunk %d/%d (%d chars, %d entities: %s)",
+            i + 1, len(chunks), len(chunk_text), len(present),
+            ", ".join(sorted(present)[:6]) + ("…" if len(present) > 6 else ""),
+        )
+        t0 = time.monotonic()
         try:
             chunk_facts, hint = _extract_facts(chunk_text, sorted(present))
-        except Exception:
-            continue  # a flaky chunk shouldn't sink the whole pass
+            log.info("enrich chunk %d/%d done %.1fs", i + 1, len(chunks), time.monotonic() - t0)
+        except Exception as exc:
+            log.warning("enrich chunk %d/%d failed: %s", i + 1, len(chunks), exc)
+            continue
         if hint:
             world_hints.append(hint)
         for lname, facts in chunk_facts.items():
-            # map the model's returned name back to a canonical bible key
             norm = name_to_norm.get(lname) or normalize_name(lname)
             facts_by_norm.setdefault(norm, []).extend(facts)
 
-    # de-dupe facts per entity while preserving order
-    for norm, facts in facts_by_norm.items():
-        seen: set[str] = set()
-        deduped = []
-        for f in facts:
-            key = f.lower()
-            if key not in seen:
-                seen.add(key)
-                deduped.append(f)
-        facts_by_norm[norm] = deduped
+    dedupe_facts(facts_by_norm)
+    strip_transient_facts(facts_by_norm)  # keep events out of the timeless identity
 
     # --- REDUCE: merge facts (+ prior descriptions) into final descriptors ---
     if progress:
         progress(0.85)
-    world = _consolidate(entities, facts_by_norm, world_hints, prior_descs)
+    world = consolidate(entities, facts_by_norm, world_hints, prior_descs)
 
-    # --- fallback: entities that came back blank or cross-referenced ---
-    bad = [e for e in entities if not e.descriptor or _CROSSREF.search(e.descriptor)]
-    for i, ent in enumerate(bad):
-        if progress:
-            progress(0.9 + 0.1 * (i / max(1, len(bad))))
-        # prefer prior description over an empty result before re-describing
-        prior = prior_descs.get(normalize_name(ent.name), "")
-        desc = _describe_one(ent.name, ent, scenes, chapters) or prior
-        ent.descriptor = desc if desc and not _CROSSREF.search(desc) else ""
-
+    fill_blank_descriptors(entities, scenes, chapters, prior_descs, progress)
     return world

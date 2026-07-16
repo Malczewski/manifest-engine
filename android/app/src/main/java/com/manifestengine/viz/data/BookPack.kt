@@ -75,5 +75,40 @@ class BookPack private constructor(
         return out
     }
 
+    /**
+     * Returns the scene whose [start_token, end_token) range contains [tokenPos],
+     * or null if no scene covers that position.
+     */
+    fun sceneForToken(tokenPos: Int): Scene? {
+        db.rawQuery(
+            "SELECT id, chapter_idx, seq, start_token, end_token, summary, image_path " +
+                "FROM scenes WHERE start_token <= ? AND end_token > ? LIMIT 1",
+            arrayOf(tokenPos.toString(), tokenPos.toString()),
+        ).use { c ->
+            if (!c.moveToFirst()) return null
+            val rel = c.getString(6) ?: return null
+            return Scene(
+                id = c.getInt(0),
+                chapterIdx = c.getInt(1),
+                seq = c.getInt(2),
+                startToken = c.getInt(3),
+                endToken = c.getInt(4),
+                summary = c.getString(5) ?: "",
+                imagePath = File(packDir, rel).absolutePath,
+            )
+        }
+    }
+
+    /**
+     * Normalizes [transcript], queries the trigram index, and returns the scene
+     * covering the best-matched token position, or null if no reliable match.
+     * [minTokenPos] prevents backward jumps into already-seen content.
+     */
+    fun matchTranscript(transcript: String, minTokenPos: Int = 0): Scene? {
+        val words = Matcher.normalize(transcript)
+        val tokenPos = Matcher.findBestTokenPosition(words, db, minTokenPos) ?: return null
+        return sceneForToken(tokenPos)
+    }
+
     override fun close() = db.close()
 }

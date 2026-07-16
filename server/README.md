@@ -43,9 +43,10 @@ with `tail -f data/engine.log`, open the **logs ↗** link in the UI, or hit
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama server |
 | `OLLAMA_MODEL` | `gemma4:12b` | segmentation + enrichment model (Ollama backend) |
 | `GEMINI_API_KEY` | (blank) | Google AI API key (`SEGMENTER=gemini`) |
-| `GEMINI_MODEL` | `gemini-2.0-flash` | Gemini model name |
+| `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model name (see Model choice below) |
 | `TARGET_SCENE_CHARS` | `1800` | approx scene length |
-| `ENRICH_CHUNK_CHARS` | `24000` | map-reduce chunk size for whole-book enrichment (≤ the LLM's context) |
+| `STATE_MODE` | (auto) | forward state pass: `fuse` (1 call/scene) \| `per_scene` (2 calls/scene). Auto = `fuse` on Gemini, `per_scene` on Ollama |
+| `ENRICH_CHUNK_CHARS` | `24000` | chunk size for the bible-only harvest (≤ the LLM's context) |
 | `COMPOSE_PROMPTS` | `1` | LLM-compose each scene prompt (only in-scene detail); `0` = mechanical |
 | `NEGATIVE_PROMPT` | (quality defaults) | negative prompt for every image |
 | `GENERATE_REFERENCES` | `0` | `1` to also generate per-entity reference images |
@@ -58,17 +59,33 @@ novel, Watercolor, Storybook, Cinematic, Photorealistic, Anime). The preset text
 plus your free-text "extra context" form the style anchor on every scene. Presets
 live in [app/styles.py](app/styles.py).
 
-**Whole-book enrichment (map-reduce):** entity descriptions are built from the
-ENTIRE book, not a sample. The text is walked in `ENRICH_CHUNK_CHARS` chunks
-(**map**: extract each entity's *stable* physical facts — species, hair, eyes,
-marks — never clothing or mood), and the facts accumulated across all chunks are
-merged per entity (**reduce**) into one descriptor. This scales to any book on any
-backend (a whole novel doesn't fit a local model's context, and a single giant
-prompt loses detail buried mid-text) and naturally separates permanent identity
-(bible) from scene-specific state (outfit/lighting), which the composer adds from
-each scene's own text. In a **series**, an earlier book's descriptor seeds the
-reduce step, so a recurring character is extended/refined; a later book only
-overrides the look where its own facts contradict the earlier one.
+**Forward state pass (whole-book, temporal):** the pipeline walks the book's
+scenes **in order** ([pipeline/statepass.py](app/pipeline/statepass.py)),
+maintaining an evolving per-entity state:
+
+- **facts** — stable physical traits (species, hair, eyes, scars) that
+  **accumulate** as the book reveals them. These never include clothing or mood.
+- **overlay** — the entity's current scene-specific visible state (outfit, injury,
+  dirt) that **overrides** and then **carries forward** until the text changes it.
+
+Each scene's image prompt = base style + a composed action line + each present
+entity's **stable identity** (synthesized from the accumulated facts, appended
+verbatim so the look and the per-cast seed stay constant) + that entity's
+**overlay as of this scene**. This is temporally correct: a scar acquired in
+chapter 20 does not appear in chapter 1, and a cloak put on in scene 5 persists
+through later scenes without being restated. The per-scene analysis runs *before*
+image generation and is checkpointed, so a resume never re-runs LLM work.
+
+`STATE_MODE` picks how the per-scene work runs: **`fuse`** does the analysis and
+the action line in one LLM call per scene (fewest calls — default on Gemini);
+**`per_scene`** splits them into two simpler calls (default on Ollama, better for
+weaker local models). Bible-only runs skip this and use a cheaper chunked fact
+**harvest** ([pipeline/enrich.py](app/pipeline/enrich.py)) instead.
+
+In a **series**, an earlier book's accumulated facts + descriptor seed the next
+book's state, so a recurring character is extended/refined; a later book overrides
+the look only where its own text contradicts the earlier one. Facts and
+descriptors persist per series in `engine.db` (`series_entities`).
 
 **Consistency (Approach A, default):** rich per-entity descriptions from the
 enrichment stage + a seed derived from each scene's character cast, so a recurring
@@ -86,15 +103,48 @@ Example with Gemini (no local GPU required for the LLM stage):
 
 ```bash
 IMAGE_BACKEND=drawthings SEGMENTER=gemini GEMINI_API_KEY=your_key \
-  uvicorn app.main:app --host 0.0.0.0 --port 8000
+  GEMINI_MODEL=gemini-2.5-flash uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-**Gemini free tier notes:** `gemini-2.0-flash` allows 15 requests/minute. A full
-book produces ~300–800 LLM calls (segmentation windows + enrichment + per-scene
-compose). The pipeline includes automatic retry with backoff on 429 responses, so
-processing will slow down but never fail outright. A paid API key removes this
-constraint. The current window sizes (≈2 K tokens per segmentation window,
-≈3 K tokens for enrichment) are well within the 1 M-token context limit.
+**Model choice (free tier).** The pipeline is sequential (one call at a time), so
+RPM/TPM are never the bottleneck — the binding limits are **requests/day (RPD)** and
+model quality. A ~100k-word novel in `fuse` mode is ~375 calls (≈70 segmentation
+windows + 1 canon + ~300 scene calls + 1 consolidate); `per_scene` roughly doubles
+the scene calls.
+
+| Model | RPD (free) | Notes |
+|---|---|---|
+| `gemini-2.5-flash` (default) | 10k | Capable enough for the fused state pass; ~25 books/day. Safe, proven id. |
+| `gemini-3.5-flash` | 10k | Newest/most capable Flash — best quality; switch to it once the token test below confirms the id. |
+| `gemini-2.0-flash` / `gemini-2.5-flash-lite` | unlimited | Highest daily volume; lite is weaker at the fused reasoning. |
+| `gemini-3.1-pro` | 250 | **Too low** — a single book exceeds it. |
+
+Each call is small (~2–6k tokens vs a 1M-token context, and 1–4M TPM), so context
+size is never a concern. The Gemini path auto-retries 429s with backoff, so hitting
+a per-minute cap only slows processing, never fails it.
+
+**Test your API key (single request)** — before running the whole pipeline:
+
+```bash
+# 1) Does the token work + is the model id valid?
+curl -s "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$GEMINI_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"contents":[{"parts":[{"text":"Reply with just: OK"}]}]}'
+
+# 2) List the exact model ids your key can use (to confirm 3.5-flash etc.)
+curl -s "https://generativelanguage.googleapis.com/v1beta/models?key=$GEMINI_API_KEY" \
+  | grep '"name"'
+```
+
+Or exercise our integration end to end (JSON-mode, same code path the pipeline uses):
+
+```bash
+GEMINI_API_KEY=your_key SEGMENTER=gemini GEMINI_MODEL=gemini-2.5-flash \
+  python3 -c 'from app.pipeline import llm; print(llm.call_json("Return JSON {\"ok\": true}"))'
+```
+
+A `{'ok': True}` (or an `OK` from the curl) confirms the key, the model id, and the
+JSON-schema plumbing all work.
 
 ## HTTP API
 
@@ -193,14 +243,29 @@ before changing the LLM pipeline** — most of these were re-learned the hard wa
     `[engine]` banner).
 12. **Thinking models:** set `"think": false` for clean structured output (qwen3),
     and never route localhost LLM/image calls through a proxy (`trust_env=False`).
+13. **Separate permanent identity from temporal state — and be strict about which
+    is which.** The identity descriptor is built from ALL the book's facts and
+    appended to EVERY scene, so anything misfiled as a "fact" leaks backward: an
+    *acquired* scar (chapter-20 fight) recorded as a permanent mark reappears in
+    chapter 1. The rule: **facts = INHERENT/born-with only** (species, hair, eyes,
+    build, freckles, birthmarks); **anything acquired during the story** (wounds,
+    event-scars, blood, ageing, haircuts, outfits) → the per-scene **overlay**,
+    which is forward-only and carries forward until it changes. Enforce it in the
+    extraction prompt AND with a deterministic backstop (`enrich.strip_transient_facts`).
+14. **Bound the running state or it fills the context.** Small models re-emit known
+    facts every scene despite "don't repeat"; appending blindly grows the per-entity
+    state, and since it's re-sent in each scene's prompt, every call gets bigger
+    (memory + token cost balloon). De-dupe facts ON INSERT and cap them
+    (`_MAX_FACTS`), cap the overlay length, and cap the world-hint list.
 
 ## `.bookpack` format
 
 A zip containing `book.db` (SQLite) + `images/`. The app reads `book.db`:
-`meta`, `chapters`, `scenes` (with `[start_token,end_token)` + `image_path`),
-`tokens` (normalized stream with char offsets), `trigrams` (inverted index for
-fuzzy matching), and `entities` (character/location bible). Full column list is
-documented in [app/bookpack.py](app/bookpack.py).
+`meta`, `chapters`, `scenes` (with `[start_token,end_token)`, `image_path`, and the
+composed `prompt`), `tokens` (normalized stream with char offsets), `trigrams`
+(inverted index for fuzzy matching), and `entities` (character/location bible with
+`descriptor` + accumulated `facts`). Schema is versioned (`SCHEMA_VERSION`); full
+column list is documented in [app/bookpack.py](app/bookpack.py).
 
 ## Layout
 
@@ -217,10 +282,12 @@ app/
     epub_parse.py    EPUB -> sections + offsets
     sections.py      keep story sections, drop front/back matter + previews
     segment.py       scenes (heuristic | ollama | gemini, windowed)
+    canon.py         consolidate entity name variants across the book (LLM)
     bible.py         characters/locations (+ name normalization/dedup)
-    enrich.py        world context + per-entity visual descriptions (LLM)
-    compose.py       LLM-composed per-scene prompt line (only in-scene detail)
-    llm.py           LLM backend dispatcher (Ollama ↔ Gemini)
+    statepass.py     forward per-scene state pass: facts (accumulate) + overlay (temporal)
+    enrich.py        bible-only fact harvest (chunked) + fact->descriptor consolidation
+    compose.py       LLM-composed per-scene action line (no appearance/clothing)
+    llm.py           LLM backend dispatcher (Ollama <-> Gemini)
     prompts.py       scene prompt + entity resolution
     imagegen.py      ImageGenerator: stub | drawthings
     tokenize.py      normalized tokens + trigram index

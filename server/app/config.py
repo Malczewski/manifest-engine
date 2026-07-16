@@ -61,9 +61,12 @@ class Settings:
     # Ollama (local)
     ollama_url: str = _env("OLLAMA_URL", "http://127.0.0.1:11434")
     ollama_model: str = _env("OLLAMA_MODEL", "gemma4:12b")
-    # Gemini (hosted) — set GEMINI_API_KEY and SEGMENTER=gemini to enable
+    # Gemini (hosted) — set GEMINI_API_KEY and SEGMENTER=gemini to enable.
+    # Default = gemini-2.5-flash: capable enough for the fused state pass, 10k
+    # requests/day free (≈25 books/day). For newest quality use gemini-3.5-flash;
+    # for unlimited daily volume use gemini-2.0-flash / gemini-2.5-flash-lite.
     gemini_api_key: str = _env("GEMINI_API_KEY", "")
-    gemini_model: str = _env("GEMINI_MODEL", "gemini-2.0-flash")
+    gemini_model: str = _env("GEMINI_MODEL", "gemini-2.5-flash")
     # target scene length in characters (heuristic + LLM guidance)
     target_scene_chars: int = _env_int("TARGET_SCENE_CHARS", 1800)
     # Compose each scene prompt with the LLM so it mentions only what's in-scene
@@ -72,16 +75,31 @@ class Settings:
     # Only entities appearing in at least this many scenes get a bible description
     # (need cross-scene consistency). One-offs are handled inline by the composer.
     bible_min_scenes: int = _env_int("BIBLE_MIN_SCENES", 2)
-    # Enrichment reads the WHOLE book via map-reduce: the text is walked in chunks
-    # of this many characters (map: extract stable facts), then merged per entity
-    # (reduce). Keep <= the LLM's context: ~24k chars (~6k tokens) is safe for
-    # 32k-context local models and Gemini alike; raise it on Gemini to cut calls.
+    # Bible-only harvest reads the WHOLE book via map-reduce: the text is walked in
+    # chunks of this many characters (map: extract stable facts), then merged per
+    # entity (reduce). Keep <= the LLM's context: ~24k chars (~6k tokens) is safe
+    # for 32k-context local models and Gemini alike; raise it on Gemini to cut calls.
     enrich_chunk_chars: int = _env_int("ENRICH_CHUNK_CHARS", 24000)
+    # Forward state pass mode (full runs): how the per-scene analysis+compose runs.
+    #   "fuse"      — ONE LLM call per scene does BOTH (scene line + state deltas);
+    #                 fewest calls, best for capable hosted models (Gemini).
+    #   "per_scene" — TWO calls per scene (state extraction, then compose); each call
+    #                 has a simpler job, better for weaker local models.
+    # Blank = auto: fuse on Gemini, per_scene on Ollama.
+    _state_mode_raw: str = _env("STATE_MODE", "")
 
     @property
     def use_llm(self) -> bool:
         """True when an LLM backend is active (ollama or gemini, not heuristic)."""
         return self.segmenter in ("ollama", "gemini")
+
+    @property
+    def state_mode(self) -> str:
+        """Resolved forward-pass mode: 'fuse' or 'per_scene'. Honors STATE_MODE if
+        set, else defaults to 'fuse' on Gemini and 'per_scene' on Ollama."""
+        if self._state_mode_raw in ("fuse", "per_scene"):
+            return self._state_mode_raw
+        return "fuse" if self.segmenter == "gemini" else "per_scene"
 
     @property
     def db_path(self) -> Path:

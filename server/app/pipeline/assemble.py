@@ -24,7 +24,7 @@ from ..bookpack import SCHEMA_VERSION, PackWriter
 from ..config import settings
 from ..log import get_logger
 from ..models import Chapter, Entity, Scene
-from . import bible, canon, enrich, epub_parse, prompts, sections, tokenize
+from . import bible, canon, enrich, epub_parse, prompts, sections, statepass, tokenize
 from .bible import normalize_name
 from .imagegen import ImageGenerator
 from .segment import segment_book
@@ -75,7 +75,7 @@ def run_pipeline(
             on_parsed(title, author)
     else:
         result = _prepare(
-            epub_path, base_prompt, prior_world, prior_bible, progress, on_parsed
+            epub_path, base_prompt, prior_world, prior_bible, progress, on_parsed, images
         )
         title, author, world, chapters, scenes, entities = result
         if not images:
@@ -121,7 +121,11 @@ def run_pipeline(
                 "title": title, "author": author, "num_scenes": n,
                 "world": world, "entities": entities, "paused": True,
             }
-        prompt = prompts.build_scene_prompt(scene, base_prompt, bible_map, world, chapters=chapters)
+        # The forward state pass precomputes scene.prompt (identity + temporal
+        # overlay); fall back to composing on the fly if it's missing (e.g. a
+        # heuristic run or an older checkpoint).
+        prompt = scene.prompt or prompts.build_scene_prompt(
+            scene, base_prompt, bible_map, world, chapters=chapters)
         seed = _scene_seed(scene)
         log.info("Scene %d/%d ch%d cast=%s seed=%d\n  prompt: %s",
                  i + 1, n, scene.chapter_idx, scene.characters, seed, prompt)
@@ -147,8 +151,8 @@ def run_pipeline(
     }
 
 
-def _prepare(epub_path, base_prompt, prior_world, prior_bible, progress, on_parsed):
-    """Parse -> sections -> segment -> bible -> enrich."""
+def _prepare(epub_path, base_prompt, prior_world, prior_bible, progress, on_parsed, images=True):
+    """Parse -> sections -> segment -> canon -> bible -> (state pass | harvest)."""
     progress("parse", 0.02, "Parsing EPUB")
     title, author, all_sections = epub_parse.parse_epub(epub_path)
     if not all_sections:
@@ -185,20 +189,35 @@ def _prepare(epub_path, base_prompt, prior_world, prior_bible, progress, on_pars
     log.info("Bible: %d entities (%s)", len(entities),
              ", ".join(e.name for e in entities if e.kind == "character")[:200])
 
-    progress("enrich", 0.25, "Describing world and characters")
-    # Collect existing stable-fact descriptors from the series so the LLM can
-    # extend rather than reinvent — cross-book continuity without freezing the
-    # description to the first book's text.
+    # Cross-book continuity: seed with the series' existing facts + descriptions so
+    # recurring entities are extended/refined, not reinvented.
     prior_descs: dict[str, str] = {
-        k: v["descriptor"]
-        for k, v in prior_bible.items()
-        if v.get("descriptor")
+        k: v["descriptor"] for k, v in prior_bible.items() if v.get("descriptor")
     }
+    prior_facts: dict[str, list[str]] = {
+        k: v["facts"] for k, v in prior_bible.items() if v.get("facts")
+    }
+    n_prior = sum(1 for e in entities if normalize_name(e.name) in prior_bible)
     world = prior_world
-    if entities or not world:
-        n_prior = sum(1 for e in entities if normalize_name(e.name) in prior_bible)
-        log.info("Enriching %d entities (%d with prior context)…", len(entities), n_prior)
-        described = enrich.enrich(
+
+    if images:
+        # Full run: forward per-scene state pass — accumulates facts, tracks the
+        # per-scene overlay, and precomposes every scene.prompt.
+        progress("statepass", 0.25, "Analyzing scenes (forward state pass)")
+        log.info("State pass over %d scenes, %d entities (%d with prior context, mode=%s)",
+                 len(scenes), len(entities), n_prior, settings.state_mode)
+        described = statepass.run(
+            entities, scenes, chapters, base_prompt,
+            prior_world=prior_world, prior_facts=prior_facts, prior_descs=prior_descs,
+            progress=lambda f: progress("statepass", 0.10 + 0.15 * f,
+                                        f"Analyzing scenes {int(f * 100)}%"),
+        )
+        world = world or described
+    else:
+        # Bible-only harvest: cheap chunk-based fact extraction (no per-scene work).
+        progress("enrich", 0.25, "Harvesting story bible")
+        log.info("Bible harvest over %d entities (%d with prior context)", len(entities), n_prior)
+        described = enrich.harvest(
             entities,
             progress=lambda f: progress("enrich", 0.25, f"Describing entities {int(f * 100)}%"),
             scenes=scenes,
@@ -206,6 +225,7 @@ def _prepare(epub_path, base_prompt, prior_world, prior_bible, progress, on_pars
             prior_descs=prior_descs or None,
         )
         world = world or described
+
     log.info("World: %s", world)
     for e in entities:
         log.info("  %s [%s]: %s", e.name, e.kind, e.descriptor)

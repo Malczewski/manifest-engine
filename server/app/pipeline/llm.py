@@ -18,6 +18,8 @@ import httpx
 from . import jsonutil
 from ..config import settings
 
+from ..log import get_logger
+log = get_logger("job")
 
 def call_json(prompt: str, schema: dict | None = None, temperature: float = 0.3) -> dict:
     """Send a prompt to the active LLM backend; return parsed JSON dict.
@@ -96,6 +98,7 @@ def _gemini(prompt: str, schema: dict | None, temperature: float) -> dict:
             timeout=120,
         )
         if resp.status_code == 429 and attempt < 3:
+            log.info("Quota exceeded; retrying in %ds", 10 * (2 ** attempt))
             time.sleep(10 * (2 ** attempt))  # 10 s, 20 s, 40 s
             continue
         resp.raise_for_status()

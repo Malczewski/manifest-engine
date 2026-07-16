@@ -12,10 +12,10 @@ book.db schema:
                                               num_tokens
     chapters(idx, title, start_offset, end_offset, start_token, end_token)
     scenes(id, chapter_idx, seq, start_offset, end_offset, start_token, end_token,
-           summary, location_id, characters, mood, time_of_day, image_path)
+           summary, location_id, characters, mood, time_of_day, image_path, prompt)
     tokens(pos, token, offset)             -- normalized stream; offset is char pos
     trigrams(gram, pos)                    -- inverted index for fuzzy matching
-    entities(id, kind, name, descriptor, image_path)
+    entities(id, kind, name, descriptor, facts, image_path)
 
 The app resolves the current token position from ASR, finds the scene whose
 [start_token, end_token) contains it, and shows scenes.image_path.
@@ -31,7 +31,7 @@ from pathlib import Path
 
 from .models import Chapter, Entity, Scene
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _PACK_SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
@@ -45,14 +45,14 @@ CREATE TABLE scenes (
     start_offset INTEGER, end_offset INTEGER,
     start_token INTEGER, end_token INTEGER,
     summary TEXT, location_id TEXT, characters TEXT,
-    mood TEXT, time_of_day TEXT, image_path TEXT
+    mood TEXT, time_of_day TEXT, image_path TEXT, prompt TEXT
 );
 CREATE TABLE tokens (pos INTEGER PRIMARY KEY, token TEXT, offset INTEGER);
 CREATE TABLE trigrams (gram TEXT, pos INTEGER);
 CREATE INDEX idx_trigrams_gram ON trigrams(gram);
 CREATE INDEX idx_scenes_tokens ON scenes(start_token, end_token);
 CREATE TABLE entities (
-    id TEXT PRIMARY KEY, kind TEXT, name TEXT, descriptor TEXT, image_path TEXT
+    id TEXT PRIMARY KEY, kind TEXT, name TEXT, descriptor TEXT, facts TEXT, image_path TEXT
 );
 """
 
@@ -100,12 +100,13 @@ class PackWriter:
 
     def write_scenes(self, scenes: list[Scene]) -> None:
         self.db.executemany(
-            "INSERT INTO scenes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO scenes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [
                 (
                     s.id, s.chapter_idx, s.seq, s.start_offset, s.end_offset,
                     s.start_token, s.end_token, s.summary, s.location_id,
                     json.dumps(s.characters), s.mood, s.time_of_day, s.image_path,
+                    s.prompt,
                 )
                 for s in scenes
             ],
@@ -122,8 +123,11 @@ class PackWriter:
 
     def write_entities(self, entities: list[Entity]) -> None:
         self.db.executemany(
-            "INSERT INTO entities VALUES (?,?,?,?,?)",
-            [(e.id, e.kind, e.name, e.descriptor, e.image_path) for e in entities],
+            "INSERT INTO entities VALUES (?,?,?,?,?,?)",
+            [
+                (e.id, e.kind, e.name, e.descriptor, json.dumps(e.facts or []), e.image_path)
+                for e in entities
+            ],
         )
 
     # -- finalize ------------------------------------------------------------

@@ -1,9 +1,17 @@
-"""Stage 5 — compose the image prompt for a scene and pick reference images.
+"""Stage 5 — assemble the image prompt for a scene and pick reference images.
 
-Prompt = base style + world + location + present characters + action + mood.
+Prompt = base style + scene line (action/location, in-scene only) + per-entity
+identity (STABLE descriptor, appended verbatim so the look + per-cast seed stay
+constant) + per-entity temporal OVERLAY (current outfit/condition at this scene).
+
 Scene names are resolved to canonical bible entities via normalize_name (the same
 merge logic bible.py uses), so "Reyes" in a scene still finds the "Captain Reyes"
 entity's description and reference image.
+
+The forward state pass (statepass.py) precomposes the scene line and fills
+scene.overlays, then calls assemble_scene_prompt. build_scene_prompt is the
+fallback for paths without a state pass (heuristic / no-LLM): it composes the
+line itself, then assembles the same way.
 """
 
 from __future__ import annotations
@@ -28,7 +36,6 @@ def _resolve(name: str, index: dict[str, Entity]) -> Entity | None:
 
 
 def _scene_body(scene: Scene, chapters: list[Chapter]) -> str:
-    """Extract the raw text for this scene from its chapter."""
     for ch in chapters:
         if ch.idx == scene.chapter_idx:
             lo = max(0, scene.start_offset - ch.start_offset)
@@ -37,25 +44,7 @@ def _scene_body(scene: Scene, chapters: list[Chapter]) -> str:
     return ""
 
 
-def build_scene_prompt(
-    scene: Scene,
-    base_prompt: str,
-    bible: dict[str, Entity],
-    world: str = "",
-    chapters: list[Chapter] | None = None,
-) -> str:
-    """Compose the prompt from style + world + entity *descriptions* + action.
-
-    Using the descriptions (not just names) is what keeps the image semantically
-    correct — otherwise the model invents its own idea of who "Cara" is.
-
-    When chapters is provided the raw scene text is reconstructed and passed to
-    the compose LLM so it can pick up scene-specific clothing / visible state.
-    """
-    chars = _index(bible, "character")
-    locs = _index(bible, "location")
-
-    loc = _resolve(scene.location_id.replace("_", " "), locs) if scene.location_id else None
+def _present_characters(scene: Scene, chars: dict[str, Entity]) -> list[Entity]:
     present: list[Entity] = []
     seen: set[str] = set()
     for c in scene.characters:
@@ -63,22 +52,21 @@ def build_scene_prompt(
         if ent and ent.descriptor and ent.id not in seen:
             seen.add(ent.id)
             present.append(ent)
+    return present
 
-    action = scene.key_action or scene.summary
-    body = _scene_body(scene, chapters) if chapters else ""
 
-    scene_line = compose.compose_scene_line(
-        style=base_prompt,
-        world=world,
-        location=(loc.descriptor or loc.name) if loc else "",
-        names=scene.characters,
-        action=action,
-        mood=scene.mood,
-        time_of_day=scene.time_of_day,
-        scene_body=body,
-    )
+def assemble_scene_prompt(
+    scene: Scene, base_prompt: str, bible: dict[str, Entity], scene_line: str
+) -> str:
+    """Build the final prompt from a precomposed scene line + bible identities +
+    this scene's temporal overlays (scene.overlays)."""
+    chars = _index(bible, "character")
+    locs = _index(bible, "location")
+    loc = _resolve(scene.location_id.replace("_", " "), locs) if scene.location_id else None
+    present = _present_characters(scene, chars)
+
     if not scene_line:
-        bits = [action]
+        bits = [scene.key_action or scene.summary]
         if loc:
             bits.append("at " + loc.name)
         if scene.time_of_day:
@@ -90,10 +78,39 @@ def build_scene_prompt(
         parts.append(base_prompt.strip())
     parts.append(scene_line)
     for ent in present:
-        if ent.descriptor:
-            parts.append(f"{ent.name}: {ent.descriptor}")
+        line = f"{ent.name}: {ent.descriptor}"
+        overlay = scene.overlays.get(ent.name)
+        if overlay:
+            line += f", currently {overlay}"
+        parts.append(line)
     parts.append("highly detailed, coherent anatomy")
     return " ".join(p.rstrip(". ") + "." for p in parts if p.strip())
+
+
+def build_scene_prompt(
+    scene: Scene,
+    base_prompt: str,
+    bible: dict[str, Entity],
+    world: str = "",
+    chapters: list[Chapter] | None = None,
+) -> str:
+    """Fallback prompt builder (no state pass): compose the scene line here, then
+    assemble it with identities + overlays exactly like the state pass would."""
+    locs = _index(bible, "location")
+    loc = _resolve(scene.location_id.replace("_", " "), locs) if scene.location_id else None
+    body = _scene_body(scene, chapters) if chapters else ""
+
+    scene_line = compose.compose_scene_line(
+        style=base_prompt,
+        world=world,
+        location=(loc.descriptor or loc.name) if loc else "",
+        names=scene.characters,
+        action=scene.key_action or scene.summary,
+        mood=scene.mood,
+        time_of_day=scene.time_of_day,
+        scene_body=body,
+    ) or ""
+    return assemble_scene_prompt(scene, base_prompt, bible, scene_line)
 
 
 def reference_images(scene: Scene, bible: dict[str, Entity]) -> list[str]:

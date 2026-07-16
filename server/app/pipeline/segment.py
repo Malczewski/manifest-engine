@@ -16,7 +16,10 @@ import re
 
 from . import llm
 from ..config import settings
+from ..log import get_logger
 from ..models import Chapter, Scene
+
+log = get_logger("segment")
 
 _SENT_END = re.compile(r"(?<=[.!?])\s+")
 
@@ -181,8 +184,10 @@ def _llm(chapter: Chapter, next_id: int, on_window=None) -> list[Scene]:
     paras = _paragraphs(chapter.text)
     if not paras:
         return []
+    windows = list(_windows(paras, _WINDOW_CHARS))
     scenes: list[Scene] = []
-    for window in _windows(paras, _WINDOW_CHARS):
+    for wi, window in enumerate(windows):
+        log.info("segment ch%d window %d/%d (%d paras)", chapter.idx, wi + 1, len(windows), len(window))
         scenes.extend(_segment_window(chapter, window, next_id + len(scenes)))
         if on_window:
             on_window()  # one window done -> advance segmentation progress
@@ -203,9 +208,7 @@ def segment_chapter(chapter: Chapter, next_id: int, on_window=None) -> list[Scen
         except Exception as exc:  # noqa: BLE001
             # Flaky model / quota / not running -> don't block, but make it
             # visible so a silent drop to heuristic isn't mistaken for success.
-            from ..log import get_logger
-
-            get_logger("segment").warning(
+            log.warning(
                 "%s segmentation failed (%s); using heuristic for chapter %d",
                 settings.segmenter, exc, chapter.idx,
             )

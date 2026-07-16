@@ -5,22 +5,22 @@ world prop (alien dogs, stick moons, structures) into moments that don't contain
 them. Instead we ask the LLM to write ONE concise line describing only what is
 visible in this scene.
 
-Character STABLE appearance (hair, species, marks) is NOT composed here — the
-caller appends the canonical descriptions verbatim so identity (and thus the
-per-cast seed consistency) stays stable across scenes.
+Neither stable appearance (hair, species, marks) NOR scene-specific state
+(current outfit, injury) is composed here — the caller appends the canonical
+identity descriptor and the per-scene overlay separately. This line is purely the
+action/setting of the moment, so it never fights the appended appearance text.
 
-Scene-SPECIFIC state (current outfit, visible injury, unusual lighting) IS
-handled here: when the raw scene body is provided, the LLM can read it and
-incorporate anything transient that the structured fields (action, mood, tod)
-don't capture.
-
-Falls back to None on any failure so the caller can use a mechanical prompt.
+Used as the compose step of the per_scene state mode, and as the fallback prompt
+line when there is no state pass. Falls back to None on any failure.
 """
 
 from __future__ import annotations
 
 from . import llm
 from ..config import settings
+from ..log import get_logger
+
+log = get_logger("compose")
 
 _PROMPT = """Write ONE image-generation prompt for a single illustrated book scene.
 Return JSON: {{"prompt": "..."}}.
@@ -34,10 +34,10 @@ Rules:
   Interpret relationship references using only the people present in THIS scene
   (e.g. 'her father' means the father of the viewpoint character listed here).
 - Keep humans anatomically human and realistic.
-- The characters' stable appearance (hair, eyes, species) comes from their bible
-  descriptions appended separately — do NOT reinvent or contradict it. Instead focus
-  on their current action and, if the scene text mentions a specific outfit, prop, or
-  visible condition, incorporate that naturally into the prompt.
+- Describe ONLY the action, pose, and setting of this moment. Do NOT describe any
+  character's appearance, clothing, or physical features — those are appended
+  separately, and repeating them here causes conflicts. Just place the named
+  characters in the scene doing the action.
 - Do NOT add creatures, buildings, moons, crowds, or world details absent from
   this specific moment. Do NOT describe faces in isolation.
 - Concrete and visual; no narration, backstory, or lists.
@@ -67,9 +67,8 @@ def compose_scene_line(
 
     scene_context = ""
     if scene_body.strip():
-        # Trim to a reasonable window — we want the LLM to pick up current
-        # clothing/state without the whole chapter overwhelming the prompt.
-        scene_context = f"\nScene text (use only for current clothing / visible state):\n{scene_body[:800]}"
+        # Trim to a reasonable window — context for the action/setting only.
+        scene_context = f"\nScene text (for the action/setting; do NOT copy appearance):\n{scene_body[:800]}"
 
     prompt = _PROMPT.format(
         style=style or "cinematic illustration",
@@ -84,5 +83,6 @@ def compose_scene_line(
     try:
         line = str(llm.call_json(prompt, temperature=0.4).get("prompt", "")).strip()
         return line or None
-    except Exception:
+    except Exception as exc:
+        log.warning("compose LLM call failed: %s", exc)
         return None

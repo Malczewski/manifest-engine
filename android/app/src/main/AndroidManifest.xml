@@ -11,16 +11,17 @@
     <application
         android:name=".VizApp"
         android:allowBackup="true"
-        android:icon="@android:drawable/sym_def_app_icon"
-        android:label="AudiobookViz"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="Manifest Engine"
         android:supportsRtl="true"
-        android:theme="@style/Theme.AudiobookViz"
+        android:theme="@style/Theme.ManifestEngine"
         android:usesCleartextTraffic="true">
 
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:theme="@style/Theme.AudiobookViz">
+            android:theme="@style/Theme.ManifestEngine">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

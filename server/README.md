@@ -34,16 +34,20 @@ with `tail -f data/engine.log`, open the **logs ↗** link in the UI, or hit
 | Var | Default | Meaning |
 |---|---|---|
 | `DATA_DIR` | `server/data` | where books, packs, and the catalog DB live |
-| `IMAGE_BACKEND` | `stub` | `stub` \| `drawthings` |
+| `IMAGE_BACKEND` | `stub` | `stub` \| `drawthings` \| `gemini` |
 | `DRAWTHINGS_URL` | `http://127.0.0.1:7860` | Draw Things API server (enable *API Server* in the app) |
-| `IMAGE_WIDTH` / `IMAGE_HEIGHT` | `768` / `512` | generated image size |
+| `IMAGE_WIDTH` / `IMAGE_HEIGHT` | `768` / `512` | exact render size for Draw Things/stub; for Gemini a downscale **cap** on the output (0×0 = keep native tier size) |
 | `IMAGE_STEPS` | `20` | sampler steps |
 | `IMAGE_MODEL` | (blank) | Draw Things model/checkpoint name; blank = app default |
+| `GEMINI_IMAGE_MODEL` | `gemini-3.1-flash-image` | Gemini image model (`IMAGE_BACKEND=gemini`, reuses `GEMINI_API_KEY`) |
+| `GEMINI_IMAGE_SIZE` | `1K` | NB2 output tier `1K`\|`2K`\|`4K` (drives price); blank for `gemini-2.5-flash-image`. `0.5K` is **not** a valid value (400) |
+| `GEMINI_ASPECT` | `3:2` | aspect ratio (matches the 768×512 Draw Things framing) |
+| `MAX_SCENE_REFS` | `4` | max reference images fed into one scene |
 | `SEGMENTER` | `heuristic` | `heuristic` \| `ollama` \| `gemini` |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama server |
 | `OLLAMA_MODEL` | `gemma4:12b` | segmentation + enrichment model (Ollama backend) |
 | `GEMINI_API_KEY` | (blank) | Google AI API key (`SEGMENTER=gemini`) |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model name (see Model choice below) |
+| `GEMINI_MODEL` | `gemini-3.5-flash` | Gemini text model (see Model choice below) |
 | `TARGET_SCENE_CHARS` | `1800` | approx scene length |
 | `STATE_MODE` | (auto) | forward state pass: `fuse` (1 call/scene) \| `per_scene` (2 calls/scene). Auto = `fuse` on Gemini, `per_scene` on Ollama |
 | `ENRICH_CHUNK_CHARS` | `24000` | chunk size for the bible-only harvest (≤ the LLM's context) |
@@ -89,8 +93,11 @@ descriptors persist per series in `engine.db` (`series_entities`).
 
 **Consistency (Approach A, default):** rich per-entity descriptions from the
 enrichment stage + a seed derived from each scene's character cast, so a recurring
-character renders consistently. Reference-image / Kontext conditioning is opt-in
-(`GENERATE_REFERENCES`, `CONTINUITY_IMG2IMG`).
+character renders consistently. **Reference-image conditioning** (character-first
+portraits fed back into scenes) is **automatic on the Gemini backend** — which has
+no seed, so references are its primary consistency lever — and opt-in elsewhere via
+`GENERATE_REFERENCES`; see *Characters first, then scenes* above. `CONTINUITY_IMG2IMG`
+(img2img between consecutive same-location scenes) remains opt-in.
 
 Example with local Ollama:
 
@@ -103,7 +110,7 @@ Example with Gemini (no local GPU required for the LLM stage):
 
 ```bash
 IMAGE_BACKEND=drawthings SEGMENTER=gemini GEMINI_API_KEY=your_key \
-  GEMINI_MODEL=gemini-2.5-flash uvicorn app.main:app --host 0.0.0.0 --port 8000
+  uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 **Model choice (free tier).** The pipeline is sequential (one call at a time), so
@@ -114,10 +121,13 @@ the scene calls.
 
 | Model | RPD (free) | Notes |
 |---|---|---|
-| `gemini-2.5-flash` (default) | 10k | Capable enough for the fused state pass; ~25 books/day. Safe, proven id. |
-| `gemini-3.5-flash` | 10k | Newest/most capable Flash — best quality; switch to it once the token test below confirms the id. |
+| `gemini-3.5-flash` (default) | 10k | Newest/most capable Flash — best quality for the fused state pass; ~25 books/day. |
+| `gemini-2.5-flash` | 10k | Fallback if your key can't use 3.5; still solid. |
 | `gemini-2.0-flash` / `gemini-2.5-flash-lite` | unlimited | Highest daily volume; lite is weaker at the fused reasoning. |
 | `gemini-3.1-pro` | 250 | **Too low** — a single book exceeds it. |
+
+Confirm your key can use the default id with the models-list command below; if not,
+set `GEMINI_MODEL=gemini-2.5-flash`.
 
 Each call is small (~2–6k tokens vs a 1M-token context, and 1–4M TPM), so context
 size is never a concern. The Gemini path auto-retries 429s with backoff, so hitting
@@ -127,11 +137,11 @@ a per-minute cap only slows processing, never fails it.
 
 ```bash
 # 1) Does the token work + is the model id valid?
-curl -s "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$GEMINI_API_KEY" \
+curl -s "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=$GEMINI_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"contents":[{"parts":[{"text":"Reply with just: OK"}]}]}'
 
-# 2) List the exact model ids your key can use (to confirm 3.5-flash etc.)
+# 2) List the exact model ids your key can use (to confirm 3.5-flash / 3.1-flash-image)
 curl -s "https://generativelanguage.googleapis.com/v1beta/models?key=$GEMINI_API_KEY" \
   | grep '"name"'
 ```
@@ -139,12 +149,78 @@ curl -s "https://generativelanguage.googleapis.com/v1beta/models?key=$GEMINI_API
 Or exercise our integration end to end (JSON-mode, same code path the pipeline uses):
 
 ```bash
-GEMINI_API_KEY=your_key SEGMENTER=gemini GEMINI_MODEL=gemini-2.5-flash \
+GEMINI_API_KEY=your_key SEGMENTER=gemini \
   python3 -c 'from app.pipeline import llm; print(llm.call_json("Return JSON {\"ok\": true}"))'
 ```
 
 A `{'ok': True}` (or an `OK` from the curl) confirms the key, the model id, and the
 JSON-schema plumbing all work.
+
+**Hosted image generation (`IMAGE_BACKEND=gemini`).** Google's Gemini image models
+("Nano Banana") render one image per prompt via generateContent — no local GPU.
+Set `IMAGE_BACKEND=gemini` (reuses `GEMINI_API_KEY`). Model choice, by free-tier
+requests/day (a ~300-scene book needs ~300 images):
+
+| `GEMINI_IMAGE_MODEL` | RPD (free) | Notes |
+|---|---|---|
+| `gemini-2.5-flash-image` (default) | 2k | Best capacity (~6 books/day). |
+| `gemini-3.1-flash-image` | 1k | Newer/better quality (~3 books/day). |
+| Imagen 4 (`imagen-4.0-*`) / Nano Banana Pro | 70 / 250 | **Too low** for a full book. |
+
+There is **no single-call batch** for a book: every scene is a distinct prompt, so
+the pipeline loops per scene (which is also what makes it pausable/resumable). The
+model has no seed or negative-prompt knob — consistency rests on the reference
+images + the verbatim identity descriptor in each prompt; the negative prompt is
+folded in as an "Avoid:" clause. Gemini renders at a size **tier**
+(`GEMINI_IMAGE_SIZE` — valid values `1K`/`2K`/`4K`, which set both resolution *and*
+price; `0.5K` is a price tier only and is rejected with HTTP 400), not exact pixels;
+`1K` at 3:2 is ~1264×848. The output is then downscaled to the
+`IMAGE_WIDTH`×`IMAGE_HEIGHT` cap (default 768×512) so packs stay small — set those
+to `0` to keep the native tier size. Since files are capped anyway, `1K` is the
+practical floor; leaving `GEMINI_IMAGE_SIZE` blank lets the model pick the cheapest
+size. Example:
+
+```bash
+IMAGE_BACKEND=gemini SEGMENTER=gemini GEMINI_API_KEY=your_key \
+  uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+**Failure handling.** Every no-image response is classified from the **full** body
+(finish reason/message, safety ratings, *and* any text the model returned — a refusal
+often comes back as plain text like "I can't generate … naked") and logged with the
+image bytes stripped:
+- **Content refusal** (`PROHIBITED_CONTENT`, blocked safety ratings, or refusal text
+  mentioning explicit content) → the LLM **sanitizes** the prompt: same scene,
+  characters, setting and tone, with the explicit parts softened to tasteful/implied
+  (no nudity/sexual detail — e.g. shoulders-up, obscured by steam), then retries.
+- **"Could not generate … try rephrasing"** (`IMAGE_OTHER`), or the model replying in
+  text instead of drawing → the LLM **rewords** the prompt and retries.
+- **Bad request (4xx)** → not retried (surfaced with Gemini's own error message);
+  **transient/5xx** → retried with backoff.
+
+Rewrites and transient retries have separate bounded budgets. If a scene is *still*
+unrenderable after sanitizing/rewording (some content Gemini simply won't draw), the
+pipeline writes a **placeholder** for that one scene and keeps going — a single
+problematic scene never fails the whole book. (Backend-down and 4xx config errors do
+fail the job, so Resume/fix works.) Re-attempt placeholdered scenes later with
+**reset-images** after adjusting the style/`extra_prompt`.
+
+A failed **reference** image is non-fatal (scenes still render from the descriptor);
+a scene that exhausts all of the above errors the job, and **Resume** picks up from
+the last good image.
+
+**Characters first, then scenes (reference-image consistency).** Because these
+models have no seed, the strongest consistency lever is reference images. When
+references are enabled (**automatic for `IMAGE_BACKEND=gemini`**, opt-in elsewhere
+via `GENERATE_REFERENCES`) the pipeline first renders one clean portrait per
+character (and an establishing view per location) from the entity's *stable*
+identity, then feeds each scene's cast portraits back in as reference images when
+generating that scene. This pairs with the facts/overlay split: the **reference
+locks the inherent identity** (face, hair), while the scene's **overlay text adds
+the temporal state** (a scar, today's outfit). Up to `MAX_SCENE_REFS` references
+(characters first, then location) go into each scene — passing an image input is
+~260–1300 tokens (≈ $0.0001–0.0005), negligible next to the ~$0.067 output. A bad
+portrait propagates consistently, so use **reset-images** to re-roll after fixing it.
 
 ## HTTP API
 
@@ -158,6 +234,8 @@ JSON-schema plumbing all work.
 | `GET` | `/jobs/{id}` | pipeline progress for a book |
 | `POST` | `/books/{id}/pause` | pause after the current scene |
 | `POST` | `/books/{id}/resume` | resume from checkpoint + existing images |
+| `POST` | `/books/{id}/reprocess` | clear everything (checkpoint + images + pack) and run from scratch |
+| `POST` | `/books/{id}/reset-images` | delete images + pack, **keep** checkpoint (prompts/LLM data), regenerate images; optional `extra_prompt` form field sets an image-only global style |
 | `GET` | `/books/{id}/pack` | download the `.bookpack` |
 | `DELETE` | `/books/{id}` | remove a book and its files |
 
@@ -172,6 +250,30 @@ Image generation dominates wall-clock time, so a run is **interruptible**:
 - `POST /books/{id}/pause` stops after the current scene (status → `paused`);
   `POST /books/{id}/resume` (or the UI button) generates only the remaining scenes,
   then assembles the pack. Re-uploading isn't needed — the checkpoint drives it.
+
+**Reset images vs reprocess.** `reset-images` (UI button, or `POST
+/books/{id}/reset-images`) deletes the generated images + stale pack but **keeps
+`checkpoint.json`** — all the LLM work (scenes, prompts, overlays, bible). The re-run
+resumes from the checkpoint (no LLM calls) and re-renders every image from the saved
+prompts. Use it to switch image backend/model or re-roll the art without paying for
+the segmentation/state-pass stages again. It's available whenever a checkpoint
+exists — including a book that only got **partway** through rendering (paused, errored,
+or a change of mind mid-run); pause first if it's still running. `reprocess` instead
+clears *everything* (checkpoint included) and re-runs the LLM stages too — use it
+after a prompt/logic change.
+
+**Add a global image style without rerunning the LLM.** `reset-images` accepts an
+optional `extra_prompt` (the UI dialog pre-fills the current one) — an image-only
+directive **appended to every scene and reference prompt at render time**, e.g.
+`"futuristic sci-fi setting, holographic panels, no wooden furniture or medieval
+buildings"`. It's stored per book (`books.extra_prompt`), **never baked into the
+checkpoint**, so you can tweak it and re-render as many times as you like while the
+paid segmentation/state-pass output stays untouched:
+
+```bash
+curl -X POST localhost:8000/books/$ID/reset-images \
+  -F 'extra_prompt=futuristic sci-fi setting, no wooden furniture'
+```
 
 Prompt quality: each scene prompt is composed by the LLM
 ([pipeline/compose.py](app/pipeline/compose.py)) to mention only what's in that
@@ -289,7 +391,7 @@ app/
     compose.py       LLM-composed per-scene action line (no appearance/clothing)
     llm.py           LLM backend dispatcher (Ollama <-> Gemini)
     prompts.py       scene prompt + entity resolution
-    imagegen.py      ImageGenerator: stub | drawthings
+    imagegen.py      ImageGenerator: stub | drawthings | gemini
     tokenize.py      normalized tokens + trigram index
     assemble.py      orchestrator: checkpoint + resumable/pausable images -> pack
 templates/index.html upload UI (multi-file, series, bible-only)

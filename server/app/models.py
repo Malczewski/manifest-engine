@@ -97,6 +97,8 @@ class BookSummary(BaseModel):
     status: JobStatus
     num_scenes: int = 0
     has_pack: bool = False
+    has_checkpoint: bool = False  # LLM work is on disk -> images can be re-rendered cheaply
+    extra_prompt: str = ""        # image-only style appended at render time (editable)
     series_id: str = ""
     series_seq: int = 0
 

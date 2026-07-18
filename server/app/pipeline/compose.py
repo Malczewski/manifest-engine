@@ -86,3 +86,61 @@ def compose_scene_line(
     except Exception as exc:
         log.warning("compose LLM call failed: %s", exc)
         return None
+
+
+_REPHRASE_PROMPT = """An image-generation model REJECTED this prompt — it could not
+generate an image from it and asked to rephrase. Rewrite the prompt so it will render,
+WITHOUT losing the scene: keep the same characters and their described appearance, the
+setting, and the action. Make it read clearly as a STYLIZED ILLUSTRATION (not a photo of
+real people), simplify awkward or repetitive phrasing, and remove anything that might
+trip a content filter. Keep it under 80 words. Return JSON: {{"prompt": "..."}}.
+
+Rejected prompt:
+{original}
+"""
+
+
+def rephrase_image_prompt(original: str) -> str | None:
+    """Ask the LLM to rewrite an image prompt the image model refused to render.
+    Returns a new prompt, or None if unavailable/unchanged."""
+    if not settings.use_llm or not original.strip():
+        return None
+    try:
+        out = llm.call_json(_REPHRASE_PROMPT.format(original=original), temperature=0.5)
+        new = str(out.get("prompt", "")).strip()
+        return new or None
+    except Exception as exc:
+        log.warning("rephrase LLM call failed: %s", exc)
+        return None
+
+
+_SANITIZE_PROMPT = """An image-generation model REFUSED this prompt for violating its
+content policy (explicit / sexual content). Rewrite it into a SAFE, policy-compliant
+image prompt that will be accepted, changing AS LITTLE as possible:
+- Keep the SAME scene, the SAME characters (and their described appearance), the setting,
+  the action, and the emotional tone. Do NOT relocate it, swap characters, or turn it
+  into a different scene.
+- Remove ONLY the explicit elements: no nudity, no sexual or graphic content. Make any
+  intimacy TASTEFUL and IMPLIED instead — e.g. a tender embrace with the figures
+  obscured by steam or shadow, modest framing — while staying true to the moment.
+- Write it as one natural, fluent image prompt (no leftover fragments), under 80 words.
+Return JSON: {{"prompt": "..."}}.
+
+Refused prompt:
+{original}
+"""
+
+
+def sanitize_image_prompt(original: str) -> str | None:
+    """Ask the LLM to rewrite a prompt the image model refused on CONTENT-POLICY
+    grounds into a tasteful, non-explicit version — keeping the scene, characters and
+    tone, softening only the explicit parts. Returns None if unavailable/unchanged."""
+    if not settings.use_llm or not original.strip():
+        return None
+    try:
+        out = llm.call_json(_SANITIZE_PROMPT.format(original=original), temperature=0.4)
+        new = str(out.get("prompt", "")).strip()
+        return new or None
+    except Exception as exc:
+        log.warning("sanitize LLM call failed: %s", exc)
+        return None

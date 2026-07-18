@@ -36,11 +36,44 @@ def _update(book_id: str, **fields) -> None:
 
 # Cooperative pause: a per-book event the image loop polls between scenes.
 _pause_events: dict[str, threading.Event] = {}
+# Book ids with a LIVE worker thread in this process. Used to tell a genuinely
+# running job (cooperative pause) from an orphan whose worker died with a crashed
+# server (force-pause / reconcile).
+_active: set[str] = set()
 
 
 def request_pause(book_id: str) -> None:
-    _pause_events.setdefault(book_id, threading.Event()).set()
-    _update(book_id, message="Pausing after current scene…")
+    """Pause a running book. If a live worker exists, ask it to stop after the
+    current scene (cooperative). If there is NO live worker — e.g. the server was
+    restarted and this book is stuck 'running' — force it to paused immediately so
+    it can be resumed."""
+    if book_id in _active:
+        _pause_events.setdefault(book_id, threading.Event()).set()
+        _update(book_id, message="Pausing after current scene…")
+    else:
+        _update(book_id, status=JobStatus.paused.value, stage="paused",
+                message="Force-paused (worker not running) — Resume to continue")
+        log.info("Book %s: force-paused (no live worker)", book_id)
+
+
+def reconcile_orphans() -> None:
+    """On startup, no worker threads exist yet, so any book still marked running or
+    queued is an orphan from a previous (crashed/stopped) process. Mark them paused
+    so they can be resumed instead of hanging 'in progress' forever."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM books WHERE status IN (?, ?)",
+            (JobStatus.running.value, JobStatus.queued.value),
+        ).fetchall()
+        for r in rows:
+            conn.execute(
+                "UPDATE books SET status=?, stage=?, message=?, updated_at=datetime('now') "
+                "WHERE id=?",
+                (JobStatus.paused.value, "paused",
+                 "Interrupted (server restarted) — Resume to continue", r["id"]),
+            )
+    if rows:
+        log.info("Reconciled %d orphaned running/queued book(s) -> paused", len(rows))
 
 
 def _run(
@@ -50,6 +83,7 @@ def _run(
     out_pack = book_dir / f"{book_id}.bookpack"
     pause_ev = _pause_events.setdefault(book_id, threading.Event())
     pause_ev.clear()  # a fresh run/resume is not paused
+    _active.add(book_id)  # mark a live worker so pause is cooperative, not forced
 
     def progress(stage: str, frac: float, msg: str) -> None:
         _update(book_id, stage=stage, progress=frac, message=msg)
@@ -62,6 +96,9 @@ def _run(
                  "bible-only" if not images else "full", series_id or "-")
         _update(book_id, status=JobStatus.running.value, message="Starting", error=None)
         prior_world, prior_bible = series_store.load_bible(series_id)
+        with connect() as conn:
+            r = conn.execute("SELECT extra_prompt FROM books WHERE id = ?", (book_id,)).fetchone()
+        extra_prompt = (r["extra_prompt"] if r else "") or ""
         summary = assemble.run_pipeline(
             epub_path=epub_path,
             base_prompt=base_prompt,
@@ -74,6 +111,7 @@ def _run(
             images=images,
             on_parsed=on_parsed,
             pause_check=pause_ev.is_set,
+            extra_prompt=extra_prompt,
         )
         # Persist what this book contributed back to the series bible.
         series_store.save_bible(series_id, summary.get("world", ""), summary.get("entities", []))
@@ -104,6 +142,8 @@ def _run(
             message="Failed — Resume to retry from checkpoint" if resumable else "Failed",
             error=f"{exc}\n{traceback.format_exc()}",
         )
+    finally:
+        _active.discard(book_id)
 
 
 def submit_batch(items: list[tuple[str, str, str, str, bool]]) -> None:
@@ -135,6 +175,40 @@ def resume(book_id: str) -> None:
         row = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
     if not row:
         return
+    submit(book_id, row["epub_path"], row["base_prompt"], row["series_id"], images=True)
+
+
+def reset_images(book_id: str, extra_prompt: str | None = None) -> None:
+    """Delete generated images (and the stale pack) but KEEP checkpoint.json — the
+    LLM work: scenes, prompts, overlays, entities/bible. Then re-run: the pipeline
+    resumes from the checkpoint (no LLM calls) and regenerates every image from the
+    existing prompts. Use this to re-render with a different image backend/model or
+    after changing the image-only style, without paying for the LLM stages again.
+
+    extra_prompt (when not None) updates the book's image-only global style — text
+    appended to every render prompt (e.g. "futuristic sci-fi setting, no wooden
+    furniture"). It is NOT part of the checkpoint, so it never triggers an LLM rerun.
+    """
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
+    if not row:
+        return
+    book_dir = settings.books_dir / book_id
+    if not (book_dir / "checkpoint.json").exists():
+        # No LLM work to preserve — fall back to a full run.
+        log.info("Reset-images %s: no checkpoint, running full pipeline", book_id)
+    for name in ("images", "pack"):
+        p = book_dir / name
+        shutil.rmtree(p, ignore_errors=True)
+    (book_dir / f"{book_id}.bookpack").unlink(missing_ok=True)
+    with connect() as conn:
+        if extra_prompt is not None:
+            conn.execute("UPDATE books SET pack_path='', extra_prompt=? WHERE id=?",
+                         (extra_prompt.strip(), book_id))
+        else:
+            conn.execute("UPDATE books SET pack_path='' WHERE id=?", (book_id,))
+    log.info("Reset-images %s: cleared images + pack, kept checkpoint (extra_prompt=%r)",
+             book_id, extra_prompt)
     submit(book_id, row["epub_path"], row["base_prompt"], row["series_id"], images=True)
 
 

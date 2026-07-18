@@ -114,15 +114,21 @@ def build_scene_prompt(
 
 
 def reference_images(scene: Scene, bible: dict[str, Entity]) -> list[str]:
-    """Relative pack paths of reference images to condition this scene on."""
+    """Relative pack paths of reference images to condition this scene on.
+
+    Characters come FIRST (they're the consistency priority, so a per-scene cap
+    keeps them over the location), the location reference last.
+    """
     chars = _index(bible, "character")
     locs = _index(bible, "location")
     refs: list[str] = []
-    loc = _resolve(scene.location_id.replace("_", " "), locs) if scene.location_id else None
-    if loc and loc.image_path:
-        refs.append(loc.image_path)
+    seen: set[str] = set()
     for c in scene.characters:
         ent = _resolve(c, chars)
-        if ent and ent.image_path:
+        if ent and ent.image_path and ent.image_path not in seen:
+            seen.add(ent.image_path)
             refs.append(ent.image_path)
+    loc = _resolve(scene.location_id.replace("_", " "), locs) if scene.location_id else None
+    if loc and loc.image_path and loc.image_path not in seen:
+        refs.append(loc.image_path)
     return refs

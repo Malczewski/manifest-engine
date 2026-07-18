@@ -31,15 +31,30 @@ class Settings:
     data_dir: Path = Path(_env("DATA_DIR", str(_SERVER_ROOT / "data")))
 
     # --- image generation ---
-    # "drawthings" (real) | "stub" (offline placeholder for tests)
+    # "drawthings" (local) | "gemini" (hosted) | "stub" (offline placeholder)
     image_backend: str = _env("IMAGE_BACKEND", "drawthings")
     drawthings_url: str = _env("DRAWTHINGS_URL", "http://127.0.0.1:7860")
+    # Generated image size. For stub/Draw Things this is the exact render size; for
+    # Gemini (which renders at a size TIER, not exact px) it's a downscale CAP applied
+    # to the output, so packs stay small. Set 0 x 0 to keep Gemini's native tier size.
     image_width: int = _env_int("IMAGE_WIDTH", 768)
     image_height: int = _env_int("IMAGE_HEIGHT", 512)
     image_steps: int = _env_int("IMAGE_STEPS", 12)
     # DT model checkpoint filename (from /sdapi/v1/options "model"); blank = whatever
     # is currently selected in the Draw Things app.
     image_model: str = _env("IMAGE_MODEL", "flux_2_klein_9b_q6p.ckpt")
+    # Gemini image model (IMAGE_BACKEND=gemini, reuses GEMINI_API_KEY). Default =
+    # gemini-3.1-flash-image ("Nano Banana 2"): best quality + character consistency.
+    # For higher free-tier volume use gemini-2.5-flash-image (set GEMINI_IMAGE_SIZE="").
+    gemini_image_model: str = _env("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image")
+    # Output size tier for Nano Banana 2. Valid API values are "1K" | "2K" | "4K"
+    # (NOT "0.5K" — that's a price tier, not a settable size, and returns HTTP 400).
+    # Blank omits the field (required for gemini-2.5-flash-image's fixed size, and
+    # lets the model pick the cheapest size). Files are shrunk to IMAGE_WIDTH/HEIGHT
+    # anyway, so "1K" then downscale is the small-file path.
+    gemini_image_size: str = _env("GEMINI_IMAGE_SIZE", "1K")
+    # Aspect ratio; 3:2 matches the Draw Things 768x512 framing. Blank = model default.
+    gemini_aspect: str = _env("GEMINI_ASPECT", "3:2")
     # Kontext model for reference-conditioned continuity (blank = disabled).
     kontext_model: str = _env("KONTEXT_MODEL", "")
     negative_prompt: str = _env(
@@ -54,6 +69,9 @@ class Settings:
     generate_references: bool = _env("GENERATE_REFERENCES", "0") == "1"
     continuity_img2img: bool = _env("CONTINUITY_IMG2IMG", "0") == "1"
     img2img_denoise: float = float(_env("IMG2IMG_DENOISE", "0.65"))
+    # Max character/location reference images fed into one scene (bounds input cost
+    # and stops big-cast scenes from confusing composition).
+    max_scene_refs: int = _env_int("MAX_SCENE_REFS", 4)
 
     # --- scene segmentation ---
     # "ollama" (local LLM) | "gemini" (hosted LLM) | "heuristic" (offline, no LLM)
@@ -62,11 +80,12 @@ class Settings:
     ollama_url: str = _env("OLLAMA_URL", "http://127.0.0.1:11434")
     ollama_model: str = _env("OLLAMA_MODEL", "gemma4:12b")
     # Gemini (hosted) — set GEMINI_API_KEY and SEGMENTER=gemini to enable.
-    # Default = gemini-2.5-flash: capable enough for the fused state pass, 10k
-    # requests/day free (≈25 books/day). For newest quality use gemini-3.5-flash;
-    # for unlimited daily volume use gemini-2.0-flash / gemini-2.5-flash-lite.
+    # Default = gemini-3.5-flash: newest/most capable Flash for the fused state pass,
+    # 10k requests/day free (≈25 books/day). Fall back to gemini-2.5-flash if your
+    # key can't use 3.5; use gemini-2.0-flash / gemini-2.5-flash-lite for unlimited
+    # daily volume. Confirm the exact id with the models?key= list (see README).
     gemini_api_key: str = _env("GEMINI_API_KEY", "")
-    gemini_model: str = _env("GEMINI_MODEL", "gemini-2.5-flash")
+    gemini_model: str = _env("GEMINI_MODEL", "gemini-3.5-flash")
     # target scene length in characters (heuristic + LLM guidance)
     target_scene_chars: int = _env_int("TARGET_SCENE_CHARS", 1800)
     # Compose each scene prompt with the LLM so it mentions only what's in-scene
@@ -92,6 +111,13 @@ class Settings:
     def use_llm(self) -> bool:
         """True when an LLM backend is active (ollama or gemini, not heuristic)."""
         return self.segmenter in ("ollama", "gemini")
+
+    @property
+    def references_enabled(self) -> bool:
+        """Generate per-entity reference images first, then feed each scene's cast
+        references into its generation. Always on for Gemini (its main consistency
+        lever, since it has no seed); opt-in elsewhere via GENERATE_REFERENCES."""
+        return self.generate_references or self.image_backend == "gemini"
 
     @property
     def state_mode(self) -> str:

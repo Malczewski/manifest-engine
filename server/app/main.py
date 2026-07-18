@@ -24,6 +24,7 @@ templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent.parent
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
+    jobs.reconcile_orphans()  # books left 'running' by a crashed/stopped process -> paused
     _log_backends()
 
 
@@ -33,9 +34,10 @@ def _log_backends() -> None:
     import httpx
 
     llm_info = settings.gemini_model if settings.segmenter == "gemini" else settings.ollama_model
+    img_info = settings.gemini_image_model if settings.image_backend == "gemini" else settings.image_model
     log.info("segmenter=%s (%s) | image=%s (%s) | compose_prompts=%s",
              settings.segmenter, llm_info, settings.image_backend,
-             settings.image_model, settings.compose_prompts)
+             img_info, settings.compose_prompts)
     if settings.segmenter == "gemini":
         if settings.gemini_api_key:
             log.info("Gemini: model=%s, API key configured", settings.gemini_model)
@@ -57,6 +59,11 @@ def _log_backends() -> None:
         except Exception as exc:  # noqa: BLE001
             log.warning("Draw Things unreachable at %s (%s); image generation will FAIL",
                         settings.drawthings_url, exc)
+    elif settings.image_backend == "gemini":
+        if settings.gemini_api_key:
+            log.info("Gemini images: model=%s, API key configured", settings.gemini_image_model)
+        else:
+            log.warning("IMAGE_BACKEND=gemini but GEMINI_API_KEY is not set; images will FAIL")
 
 
 def _row_to_summary(row) -> BookSummary:
@@ -67,6 +74,8 @@ def _row_to_summary(row) -> BookSummary:
         status=JobStatus(row["status"]),
         num_scenes=row["num_scenes"],
         has_pack=bool(row["pack_path"]),
+        has_checkpoint=(settings.books_dir / row["id"] / "checkpoint.json").exists(),
+        extra_prompt=row["extra_prompt"] or "",
         series_id=row["series_id"],
         series_seq=row["series_seq"],
     )
@@ -190,6 +199,15 @@ def resume_book(book_id: str):
 def reprocess_book(book_id: str):
     jobs.reprocess(book_id)
     return {"reprocessing": book_id}
+
+
+@app.post("/books/{book_id}/reset-images")
+def reset_images_book(book_id: str, extra_prompt: str | None = Form(default=None)):
+    """Regenerate images from the existing prompts (keeps all LLM-processed data).
+    Optional `extra_prompt` sets the image-only global style appended to every
+    render (e.g. "futuristic sci-fi setting")."""
+    jobs.reset_images(book_id, extra_prompt=extra_prompt)
+    return {"resetting_images": book_id}
 
 
 @app.get("/books/{book_id}/pack")

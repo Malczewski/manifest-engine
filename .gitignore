@@ -17,3 +17,4 @@ gradlew.bat
 .DS_Store
 
 android/local.properties
+.env

@@ -131,8 +131,11 @@ async function refresh() {
         actions = `<button class="secondary" onclick="pause('${b.id}')">pause</button> `;
       else if (job.status === 'paused' || job.status === 'error')
         actions = `<button class="secondary" onclick="resume('${b.id}')">resume</button> `;
-      if (job.status === 'done' || job.status === 'error' || job.status === 'paused')
+      if (job.status === 'done' || job.status === 'error' || job.status === 'paused') {
         actions += `<button class="secondary" onclick="reprocess('${b.id}')">reprocess</button> `;
+        if (b.has_checkpoint)
+          actions += `<button class="secondary" onclick="resetImages('${b.id}', '${encodeURIComponent(b.extra_prompt || '')}')">reset images</button> `;
+      }
       const bibleTag = (job.status === 'done' && !b.has_pack) ? '<span class="tag">bible</span> ' : '';
       const tr = document.createElement('tr');
       tr.innerHTML =
@@ -159,6 +162,19 @@ async function resume(id) { await fetch('/books/' + id + '/resume', { method: 'P
 async function reprocess(id) {
   if (!confirm('Reprocess from scratch? Existing images for this book are discarded.')) return;
   await fetch('/books/' + id + '/reprocess', { method: 'POST' }); refresh();
+}
+async function resetImages(id, currentEnc) {
+  const current = decodeURIComponent(currentEnc || '');
+  const extra = prompt(
+    'Regenerate ALL images from the saved prompts (text/LLM data is kept).\n\n' +
+    'Optional global image style applied to every scene (e.g. "futuristic sci-fi setting, ' +
+    'holographic panels, no wooden furniture"). Leave as-is to keep current:',
+    current);
+  if (extra === null) return;  // cancelled
+  const fd = new FormData();
+  fd.append('extra_prompt', extra);
+  await fetch('/books/' + id + '/reset-images', { method: 'POST', body: fd });
+  refresh();
 }
 document.getElementById('upload').addEventListener('submit', async (e) => {
   e.preventDefault();

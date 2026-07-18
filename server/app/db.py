@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS books (
     title       TEXT NOT NULL DEFAULT '',
     author      TEXT NOT NULL DEFAULT '',
     base_prompt TEXT NOT NULL DEFAULT '',
+    extra_prompt TEXT NOT NULL DEFAULT '',
     epub_path   TEXT NOT NULL DEFAULT '',
     pack_path   TEXT NOT NULL DEFAULT '',
     num_scenes  INTEGER NOT NULL DEFAULT 0,
@@ -62,6 +63,7 @@ _MIGRATIONS = [
     ("books", "series_id", "TEXT NOT NULL DEFAULT ''"),
     ("books", "series_seq", "INTEGER NOT NULL DEFAULT 0"),
     ("series_entities", "facts", "TEXT NOT NULL DEFAULT '[]'"),
+    ("books", "extra_prompt", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 

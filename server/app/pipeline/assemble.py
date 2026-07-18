@@ -26,7 +26,7 @@ from ..log import get_logger
 from ..models import Chapter, Entity, Scene
 from . import bible, canon, enrich, epub_parse, prompts, sections, statepass, tokenize
 from .bible import normalize_name
-from .imagegen import ImageGenerator
+from .imagegen import ImageGenerator, ImagePromptRejected, StubGenerator
 from .segment import segment_book
 
 log = get_logger("pipeline")
@@ -52,6 +52,7 @@ def run_pipeline(
     images: bool = True,
     on_parsed: Callable[[str, str], None] | None = None,
     pause_check: PauseCheck | None = None,
+    extra_prompt: str = "",
 ) -> dict:
     """Execute the full pipeline. Returns a small summary dict.
 
@@ -88,17 +89,38 @@ def run_pipeline(
 
     bible_map: dict[str, Entity] = {f"{e.kind}:{e.id}": e for e in entities}
 
-    # --- reference images for bible entities (opt-in), idempotent ---
-    if settings.generate_references:
-        for ent in entities:
+    # --- reference images for bible entities (characters FIRST, then scenes) ---
+    # Generate one clean portrait per entity from its stable identity, then feed the
+    # relevant references into each scene so a recurring character stays consistent.
+    # Auto-on for Gemini (its main consistency lever); opt-in elsewhere.
+    if settings.references_enabled:
+        refs = [e for e in entities if e.kind == "character"] + \
+               [e for e in entities if e.kind != "character"]
+        for ent in refs:
             rel = f"images/{ent.kind[:4]}_{ent.id}.png"
-            ent.image_path = rel
             fp = work_dir / rel
-            if not (fp.exists() and fp.stat().st_size):
-                fp.write_bytes(generator.generate(
-                    f"{base_prompt}. character reference, {ent.name}: {ent.descriptor}",
-                    _seed(ent.id),
-                ))
+            if fp.exists() and fp.stat().st_size:
+                ent.image_path = rel
+                continue
+            if ent.kind == "character":
+                ref_prompt = (f"{base_prompt}. Character reference portrait, full figure, "
+                              f"neutral pose, plain background. {ent.name}: {ent.descriptor}")
+            else:
+                ref_prompt = (f"{base_prompt}. Location reference, establishing view, no people. "
+                              f"{ent.name}: {ent.descriptor}")
+            ref_prompt = _apply_extra(ref_prompt, extra_prompt)
+            log.info("Reference image: %s [%s]", ent.name, ent.kind)
+            try:
+                # Retries transient failures; a reference is a nice-to-have, so a hard
+                # failure (e.g. a safety block on a character portrait) is NON-FATAL —
+                # log and move on. Scenes still render from the descriptor text, they
+                # just won't have this reference to condition on.
+                fp.write_bytes(_generate_with_retry(
+                    generator, ref_prompt, _seed(ent.id), None, 0, 0, label=f"ref {ent.name}"))
+                ent.image_path = rel
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Reference image FAILED for %s [%s]: %s — continuing without it",
+                            ent.name, ent.kind, exc)
 
     # --- scene images (dominant cost): idempotent + pausable ---
     n = len(scenes)
@@ -126,13 +148,31 @@ def run_pipeline(
         # heuristic run or an older checkpoint).
         prompt = scene.prompt or prompts.build_scene_prompt(
             scene, base_prompt, bible_map, world, chapters=chapters)
+        # Image-only global style, applied at RENDER time (never baked into the
+        # checkpoint) so it can be changed and re-rendered without rerunning the LLM.
+        prompt = _apply_extra(prompt, extra_prompt)
         seed = _scene_seed(scene)
         log.info("Scene %d/%d ch%d cast=%s seed=%d\n  prompt: %s",
                  i + 1, n, scene.chapter_idx, scene.characters, seed, prompt)
         init = last_by_loc.get(scene.location_id) if (
             settings.continuity_img2img and scene.location_id) else None
+        # Feed this scene's cast (and location) reference images so recurring
+        # characters render consistently. Capped to bound input cost/composition.
+        ref_images: list[bytes] = []
+        if settings.references_enabled:
+            for rel_ref in prompts.reference_images(scene, bible_map)[: settings.max_scene_refs]:
+                rp = work_dir / rel_ref
+                if rp.exists() and rp.stat().st_size:
+                    ref_images.append(rp.read_bytes())
         t0 = time.time()
-        png = _generate_with_retry(generator, prompt, seed, init, i + 1, n)
+        try:
+            png = _generate_with_retry(generator, prompt, seed, init, i + 1, n,
+                                       ref_images=ref_images or None)
+        except ImagePromptRejected as exc:
+            # Content the image model won't draw even after sanitizing/rewording.
+            # Don't fail the whole book — write a placeholder and keep going.
+            log.warning("Scene %d/%d unrenderable, using placeholder: %s", i + 1, n, exc)
+            png = _placeholder_png(f"scene {i + 1}: image unavailable (content filtered)")
         fp.write_bytes(png)
         log.info("Scene %d/%d done in %.1fs (%d KB)", i + 1, n, time.time() - t0, len(png) // 1024)
         if settings.continuity_img2img and scene.location_id:
@@ -288,24 +328,73 @@ def _load_checkpoint(path: Path):
 
 
 
-def _generate_with_retry(generator, prompt, seed, init, idx, total, attempts=3):
-    """Retry transient image-backend failures with backoff. If it still fails, the
-    job errors out — but already-generated images are on disk, so Resume continues
-    from here once the backend is back."""
-    last: Exception | None = None
-    for attempt in range(1, attempts + 1):
+def _generate_with_retry(generator, prompt, seed, init, idx, total, attempts=3,
+                         ref_images=None, label=""):
+    """Generate one image, handling the three failure modes with separate budgets:
+
+      * prompt rejected (content/policy or "couldn't render") -> rewrite the prompt
+        (sanitize or reword) up to _MAX_REPHRASES times; if still rejected, re-raise
+        the ImagePromptRejected so the caller can decide (scenes -> placeholder).
+      * bad request / non-retriable (ImageRequestError) -> re-raise (fatal).
+      * transient (network/5xx/empty) -> retry the SAME prompt up to `attempts`.
+    """
+    from . import compose
+    from .imagegen import ImagePromptRejected, ImageRequestError
+
+    who = label or f"scene {idx}/{total}"
+    current = prompt
+    rewrites = 0
+    transient = 0
+    while True:
         try:
-            return generator.generate(prompt, seed, init)
-        except Exception as exc:  # noqa: BLE001
-            last = exc
-            log.warning("Scene %d/%d image failed (attempt %d/%d): %s",
-                        idx, total, attempt, attempts, exc)
-            if attempt < attempts:
-                time.sleep(3 * attempt)
-    raise RuntimeError(
-        f"Image generation failed at scene {idx}/{total} after {attempts} attempts "
-        f"(is the image backend running?): {last}"
-    )
+            return generator.generate(current, seed, init, ref_images)
+        except ImagePromptRejected as exc:
+            new = None
+            if rewrites < _MAX_REPHRASES:
+                if getattr(exc, "policy", False):
+                    new, kind = compose.sanitize_image_prompt(current), "sanitized"
+                else:
+                    new, kind = compose.rephrase_image_prompt(current), "rephrased"
+            if new and new != current:
+                rewrites += 1
+                current = new
+                log.info("%s prompt rejected; %s (#%d) and retrying:\n  %s",
+                         who, kind, rewrites, current)
+                continue
+            log.warning("%s unrenderable after %d rewrite(s): %s", who, rewrites, exc)
+            raise  # let the caller placeholder/skip it
+        except ImageRequestError:
+            raise  # bad request / config — retrying won't help
+        except Exception as exc:  # noqa: BLE001 - transient backend failure
+            transient += 1
+            log.warning("%s image failed (transient %d/%d): %s", who, transient, attempts, exc)
+            if transient < attempts:
+                time.sleep(3 * transient)
+                continue
+            raise RuntimeError(
+                f"Image generation failed for {who} after {attempts} attempts "
+                f"(is the image backend running?): {exc}"
+            ) from exc
+
+
+# How many times to ask the LLM to rewrite a prompt the image model refused to
+# render before giving up on that image.
+_MAX_REPHRASES = 2
+
+
+def _placeholder_png(text: str) -> bytes:
+    """A neutral placeholder image for a scene the model refuses to render, so one
+    unrenderable scene doesn't fail the whole book (re-attempt later via reset-images)."""
+    return StubGenerator().generate(text, 0)
+
+
+def _apply_extra(prompt: str, extra: str) -> str:
+    """Append the book's image-only global style (e.g. 'futuristic sci-fi setting')
+    to a render prompt. Kept out of the checkpoint so it's freely editable."""
+    extra = (extra or "").strip()
+    if not extra:
+        return prompt
+    return f"{prompt.rstrip('. ')}. {extra}"
 
 
 def _seed(key: str) -> int:
